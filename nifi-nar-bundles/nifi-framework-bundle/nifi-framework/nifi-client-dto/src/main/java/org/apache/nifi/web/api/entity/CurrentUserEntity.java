@@ -16,7 +16,7 @@
  */
 package org.apache.nifi.web.api.entity;
 
-import com.wordnik.swagger.annotations.ApiModelProperty;
+import io.swagger.annotations.ApiModelProperty;
 import org.apache.nifi.web.api.dto.PermissionsDTO;
 
 import javax.xml.bind.annotation.XmlRootElement;
@@ -37,6 +37,8 @@ public class CurrentUserEntity extends Entity {
     private PermissionsDTO policiesPermissions;
     private PermissionsDTO systemPermissions;
     private PermissionsDTO restrictedComponentsPermissions;
+
+    private boolean canVersionFlows;
 
     /**
      * @return the user identity being serialized
@@ -144,5 +146,17 @@ public class CurrentUserEntity extends Entity {
 
     public void setRestrictedComponentsPermissions(PermissionsDTO restrictedComponentsPermissions) {
         this.restrictedComponentsPermissions = restrictedComponentsPermissions;
+    }
+
+    /**
+     * @return whether the current user can version flows
+     */
+    @ApiModelProperty("Whether the current user can version flows.")
+    public boolean isCanVersionFlows() {
+        return canVersionFlows;
+    }
+
+    public void setCanVersionFlows(boolean canVersionFlows) {
+        this.canVersionFlows = canVersionFlows;
     }
 }

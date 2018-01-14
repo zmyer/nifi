@@ -16,12 +16,12 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.ConnectionAuthorizable;
@@ -33,6 +33,7 @@ import org.apache.nifi.connectable.ConnectableType;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
 import org.apache.nifi.web.api.dto.ConnectionDTO;
+import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.entity.ConnectionEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
@@ -51,6 +52,7 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.Context;
 import javax.ws.rs.core.MediaType;
 import javax.ws.rs.core.Response;
+import java.util.List;
 import java.util.Set;
 
 /**
@@ -105,8 +107,8 @@ public class ConnectionResource extends ApplicationResource {
             value = "Gets a connection",
             response = ConnectionEntity.class,
             authorizations = {
-                    @Authorization(value = "Read Source - /{component-type}/{uuid}", type = ""),
-                    @Authorization(value = "Read Destination - /{component-type}/{uuid}", type = "")
+                    @Authorization(value = "Read Source - /{component-type}/{uuid}"),
+                    @Authorization(value = "Read Destination - /{component-type}/{uuid}")
             }
     )
     @ApiResponses(
@@ -141,7 +143,7 @@ public class ConnectionResource extends ApplicationResource {
         populateRemainingConnectionEntityContent(entity);
 
         // generate the response
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -161,10 +163,10 @@ public class ConnectionResource extends ApplicationResource {
             value = "Updates a connection",
             response = ConnectionEntity.class,
             authorizations = {
-                    @Authorization(value = "Write Source - /{component-type}/{uuid}", type = ""),
-                    @Authorization(value = "Write Destination - /{component-type}/{uuid}", type = ""),
-                    @Authorization(value = "Write New Destination - /{component-type}/{uuid} - if updating Destination", type = ""),
-                    @Authorization(value = "Write Process Group - /process-groups/{uuid} - if updating Destination", type = "")
+                    @Authorization(value = "Write Source - /{component-type}/{uuid}"),
+                    @Authorization(value = "Write Destination - /{component-type}/{uuid}"),
+                    @Authorization(value = "Write New Destination - /{component-type}/{uuid} - if updating Destination"),
+                    @Authorization(value = "Write Process Group - /process-groups/{uuid} - if updating Destination")
             }
     )
     @ApiResponses(
@@ -211,6 +213,15 @@ public class ConnectionResource extends ApplicationResource {
 
             if (requestConnection.getDestination().getType() == null) {
                 throw new IllegalArgumentException("When specifying a destination component, the type of the destination is required.");
+            }
+        }
+
+        final List<PositionDTO> proposedBends = requestConnection.getBends();
+        if (proposedBends != null) {
+            for (final PositionDTO proposedBend : proposedBends) {
+                if (proposedBend.getX() == null || proposedBend.getY() == null) {
+                    throw new IllegalArgumentException("The x and y coordinate of the each bend must be specified.");
+                }
             }
         }
 
@@ -261,7 +272,7 @@ public class ConnectionResource extends ApplicationResource {
                     populateRemainingConnectionEntityContent(entity);
 
                     // generate the response
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 });
     }
 
@@ -283,8 +294,9 @@ public class ConnectionResource extends ApplicationResource {
             value = "Deletes a connection",
             response = ConnectionEntity.class,
             authorizations = {
-                    @Authorization(value = "Write Source - /{component-type}/{uuid}", type = ""),
-                    @Authorization(value = "Write Destination - /{component-type}/{uuid}", type = "")
+                    @Authorization(value = "Write Source - /{component-type}/{uuid}"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}"),
+                    @Authorization(value = "Write Destination - /{component-type}/{uuid}")
             }
     )
     @ApiResponses(
@@ -333,7 +345,12 @@ public class ConnectionResource extends ApplicationResource {
                 lookup -> {
                     // verifies write access to the source and destination
                     final Authorizable authorizable = lookup.getConnection(id).getAuthorizable();
+
+                    // ensure write permission to the connection
                     authorizable.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+
+                    // ensure write permission to the parent process group
+                    authorizable.getParentAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
                 },
                 () -> serviceFacade.verifyDeleteConnection(id),
                 (revision, connectionEntity) -> {
@@ -341,7 +358,7 @@ public class ConnectionResource extends ApplicationResource {
                     final ConnectionEntity entity = serviceFacade.deleteConnection(revision, connectionEntity.getId());
 
                     // generate the response
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }

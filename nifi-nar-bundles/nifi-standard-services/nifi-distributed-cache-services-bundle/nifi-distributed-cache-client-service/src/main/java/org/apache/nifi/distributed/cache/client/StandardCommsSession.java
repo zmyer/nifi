@@ -16,6 +16,8 @@
  */
 package org.apache.nifi.distributed.cache.client;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,8 +27,6 @@ import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 
-import org.apache.nifi.stream.io.BufferedInputStream;
-import org.apache.nifi.stream.io.BufferedOutputStream;
 import org.apache.nifi.remote.io.InterruptableInputStream;
 import org.apache.nifi.remote.io.InterruptableOutputStream;
 import org.apache.nifi.remote.io.socket.SocketChannelInputStream;
@@ -45,9 +45,13 @@ public class StandardCommsSession implements CommsSession {
     private final SocketChannelOutputStream out;
     private final InterruptableOutputStream bufferedOut;
 
-    public StandardCommsSession(final String hostname, final int port) throws IOException {
-        socketChannel = SocketChannel.open(new InetSocketAddress(hostname, port));
+    private int protocolVersion;
+
+    public StandardCommsSession(final String hostname, final int port, final int timeoutMillis) throws IOException {
+        socketChannel = SocketChannel.open();
+        socketChannel.socket().connect(new InetSocketAddress(hostname, port), timeoutMillis);
         socketChannel.configureBlocking(false);
+
         in = new SocketChannelInputStream(socketChannel);
         bufferedIn = new InterruptableInputStream(new BufferedInputStream(in));
 
@@ -122,4 +126,15 @@ public class StandardCommsSession implements CommsSession {
     public long getTimeout(final TimeUnit timeUnit) {
         return timeUnit.convert(timeoutMillis, TimeUnit.MILLISECONDS);
     }
+
+    @Override
+    public int getProtocolVersion() {
+        return protocolVersion;
+    }
+
+    @Override
+    public void setProtocolVersion(final int protocolVersion) {
+        this.protocolVersion = protocolVersion;
+    }
+
 }

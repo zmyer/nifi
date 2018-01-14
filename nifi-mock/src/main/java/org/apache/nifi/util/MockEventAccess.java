@@ -18,7 +18,9 @@ package org.apache.nifi.util;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.nifi.action.Action;
 import org.apache.nifi.controller.status.ProcessGroupStatus;
@@ -31,14 +33,23 @@ public class MockEventAccess implements EventAccess {
     private ProcessGroupStatus processGroupStatus;
     private final List<ProvenanceEventRecord> provenanceRecords = new ArrayList<>();
     private final List<Action> flowChanges = new ArrayList<>();
+    private final Map<String, ProcessGroupStatus> processGroupStatusMap = new HashMap<>();
 
     public void setProcessGroupStatus(final ProcessGroupStatus status) {
         this.processGroupStatus = status;
+    }
+    public void setProcessGroupStatus(String groupId, final ProcessGroupStatus status) {
+        processGroupStatusMap.put(groupId, status);
     }
 
     @Override
     public ProcessGroupStatus getControllerStatus() {
         return processGroupStatus;
+    }
+
+    @Override
+    public ProcessGroupStatus getGroupStatus(final String groupId) {
+        return processGroupStatusMap.get(groupId);
     }
 
     @Override
@@ -65,6 +76,7 @@ public class MockEventAccess implements EventAccess {
         this.provenanceRecords.add(record);
     }
 
+    @Override
     public ProvenanceEventRepository getProvenanceRepository() {
         return null;
     }

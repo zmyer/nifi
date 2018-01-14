@@ -58,16 +58,18 @@ import org.apache.nifi.processors.lumberjack.frame.LumberjackEncoder;
 import org.apache.nifi.processors.lumberjack.handler.LumberjackSocketChannelHandlerFactory;
 import org.apache.nifi.processors.lumberjack.response.LumberjackChannelResponse;
 import org.apache.nifi.processors.lumberjack.response.LumberjackResponse;
+import org.apache.nifi.ssl.RestrictedSSLContextService;
 import org.apache.nifi.ssl.SSLContextService;
 
 import com.google.gson.Gson;
 
+@Deprecated
 @InputRequirement(InputRequirement.Requirement.INPUT_FORBIDDEN)
 @Tags({"listen", "lumberjack", "tcp", "logs"})
-@CapabilityDescription("Listens for Lumberjack messages being sent to a given port over TCP. Each message will be " +
+@CapabilityDescription("This processor is deprecated and may be removed in the near future. Listens for Lumberjack messages being sent to a given port over TCP. Each message will be " +
     "acknowledged after successfully writing the message to a FlowFile. Each FlowFile will contain data " +
     "portion of one or more Lumberjack frames. In the case where the Lumberjack frames contain syslog messages, the " +
-    "output of this processor can be sent to a ParseSyslog processor for further processing.")
+    "output of this processor can be sent to a ParseSyslog processor for further processing. ")
 @WritesAttributes({
     @WritesAttribute(attribute = "lumberjack.sender", description = "The sending host of the messages."),
     @WritesAttribute(attribute = "lumberjack.port", description = "The sending port the messages were received over."),
@@ -76,6 +78,9 @@ import com.google.gson.Gson;
     @WritesAttribute(attribute = "mime.type", description = "The mime.type of the content which is text/plain")
 })
 @SeeAlso(classNames = {"org.apache.nifi.processors.standard.ParseSyslog"})
+/**
+ * @deprecated  As of release 1.2.0, replaced by {@link org.apache.nifi.processors.beats.ListenBeats}
+ * */
 public class ListenLumberjack extends AbstractListenEventBatchingProcessor<LumberjackEvent> {
 
     public static final PropertyDescriptor SSL_CONTEXT_SERVICE = new PropertyDescriptor.Builder()
@@ -85,7 +90,7 @@ public class ListenLumberjack extends AbstractListenEventBatchingProcessor<Lumbe
             "two-way SSL authentication, the controller MUST have a truststore and a keystore to work" +
             "properly.")
         .required(true)
-        .identifiesControllerService(SSLContextService.class)
+        .identifiesControllerService(RestrictedSSLContextService.class)
         .build();
 
     @Override

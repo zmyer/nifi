@@ -16,7 +16,7 @@
  */
 package org.apache.nifi.web.api.dto.status;
 
-import com.wordnik.swagger.annotations.ApiModelProperty;
+import io.swagger.annotations.ApiModelProperty;
 import org.apache.nifi.web.api.entity.ConnectionStatusSnapshotEntity;
 import org.apache.nifi.web.api.entity.PortStatusSnapshotEntity;
 import org.apache.nifi.web.api.entity.ProcessGroupStatusSnapshotEntity;
@@ -42,6 +42,8 @@ public class ProcessGroupStatusSnapshotDTO implements Cloneable {
     private Collection<RemoteProcessGroupStatusSnapshotEntity> remoteProcessGroupStatusSnapshots;
     private Collection<PortStatusSnapshotEntity> inputPortStatusSnapshots;
     private Collection<PortStatusSnapshotEntity> outputPortStatusSnapshots;
+
+    private String versionedFlowState;
 
     private Integer flowFilesIn = 0;
     private Long bytesIn = 0L;
@@ -100,6 +102,17 @@ public class ProcessGroupStatusSnapshotDTO implements Cloneable {
 
     public void setName(String name) {
         this.name = name;
+    }
+
+    @ApiModelProperty(readOnly = true,
+            value = "The current state of the Process Group, as it relates to the Versioned Flow",
+            allowableValues = "LOCALLY_MODIFIED_DESCENDANT, LOCALLY_MODIFIED, STALE, LOCALLY_MODIFIED_AND_STALE, UP_TO_DATE")
+    public String getVersionedFlowState() {
+        return versionedFlowState;
+    }
+
+    public void setVersionedFlowState(String versionedFlowState) {
+        this.versionedFlowState = versionedFlowState;
     }
 
     /**
@@ -477,6 +490,7 @@ public class ProcessGroupStatusSnapshotDTO implements Cloneable {
         final ProcessGroupStatusSnapshotDTO other = new ProcessGroupStatusSnapshotDTO();
         other.setId(getId());
         other.setName(getName());
+        other.setVersionedFlowState(getVersionedFlowState());
 
         other.setBytesIn(getBytesIn());
         other.setFlowFilesIn(getFlowFilesIn());

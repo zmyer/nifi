@@ -16,12 +16,12 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
@@ -30,6 +30,7 @@ import org.apache.nifi.authorization.user.NiFiUserUtils;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
 import org.apache.nifi.web.api.dto.LabelDTO;
+import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.entity.LabelEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
@@ -101,7 +102,7 @@ public class LabelResource extends ApplicationResource {
             value = "Gets a label",
             response = LabelEntity.class,
             authorizations = {
-                    @Authorization(value = "Read - /labels/{uuid}", type = "")
+                    @Authorization(value = "Read - /labels/{uuid}")
             }
     )
     @ApiResponses(
@@ -134,7 +135,7 @@ public class LabelResource extends ApplicationResource {
         final LabelEntity entity = serviceFacade.getLabel(id);
         populateRemainingLabelEntityContent(entity);
 
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -153,7 +154,7 @@ public class LabelResource extends ApplicationResource {
             value = "Updates a label",
             response = LabelEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /labels/{uuid}", type = "")
+                    @Authorization(value = "Write - /labels/{uuid}")
             }
     )
     @ApiResponses(
@@ -192,6 +193,13 @@ public class LabelResource extends ApplicationResource {
                     + "label id of the requested resource (%s).", requestLabelDTO.getId(), id));
         }
 
+        final PositionDTO proposedPosition = requestLabelDTO.getPosition();
+        if (proposedPosition != null) {
+            if (proposedPosition.getX() == null || proposedPosition.getY() == null) {
+                throw new IllegalArgumentException("The x and y coordinate of the proposed position must be specified.");
+            }
+        }
+
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestLabelEntity);
         }
@@ -214,7 +222,7 @@ public class LabelResource extends ApplicationResource {
                     final LabelEntity entity = serviceFacade.updateLabel(revision, labelDTO);
                     populateRemainingLabelEntityContent(entity);
 
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }
@@ -236,7 +244,8 @@ public class LabelResource extends ApplicationResource {
             value = "Deletes a label",
             response = LabelEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /labels/{uuid}", type = "")
+                    @Authorization(value = "Write - /labels/{uuid}"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}")
             }
     )
     @ApiResponses(
@@ -281,13 +290,18 @@ public class LabelResource extends ApplicationResource {
                 requestRevision,
                 lookup -> {
                     final Authorizable label = lookup.getLabel(id);
+
+                    // ensure write permission to the label
                     label.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+
+                    // ensure write permission to the parent process group
+                    label.getParentAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
                 },
                 null,
                 (revision, labelEntity) -> {
                     // delete the specified label
                     final LabelEntity entity = serviceFacade.deleteLabel(revision, labelEntity.getId());
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }

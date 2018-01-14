@@ -39,8 +39,11 @@ public class SystemDiagnostics implements Cloneable {
     private int totalThreads;
     private int daemonThreads;
 
+    private long uptime;
+
     private StorageUsage flowFileRepositoryStorageUsage;
     private Map<String, StorageUsage> contentRepositoryStorageUsage;
+    private Map<String, StorageUsage> provenanceRepositoryStorageUsage;
     private Map<String, GarbageCollection> garbageCollection;
 
     private long creationTimestamp;
@@ -93,6 +96,10 @@ public class SystemDiagnostics implements Cloneable {
         this.contentRepositoryStorageUsage = contentRepositoryStorageUsage;
     }
 
+    public void setProvenanceRepositoryStorageUsage(final Map<String, StorageUsage> provenanceRepositoryStorageUsage) {
+        this.provenanceRepositoryStorageUsage = provenanceRepositoryStorageUsage;
+    }
+
     public long getTotalNonHeap() {
         return totalNonHeap;
     }
@@ -141,6 +148,10 @@ public class SystemDiagnostics implements Cloneable {
         return contentRepositoryStorageUsage;
     }
 
+    public Map<String, StorageUsage> getProvenanceRepositoryStorageUsage() {
+        return provenanceRepositoryStorageUsage;
+    }
+
     public long getFreeNonHeap() {
         return totalNonHeap - usedNonHeap;
     }
@@ -181,6 +192,14 @@ public class SystemDiagnostics implements Cloneable {
         this.creationTimestamp = creationTimestamp;
     }
 
+    public long getUptime() {
+        return uptime;
+    }
+
+    public void setUptime(long uptime) {
+        this.uptime = uptime;
+    }
+
     @Override
     public SystemDiagnostics clone() {
         final SystemDiagnostics clonedObj = new SystemDiagnostics();
@@ -193,6 +212,13 @@ public class SystemDiagnostics implements Cloneable {
             final Map<String, StorageUsage> clonedMap = new LinkedHashMap<>();
             clonedObj.setContentRepositoryStorageUsage(clonedMap);
             for (final Map.Entry<String, StorageUsage> entry : contentRepositoryStorageUsage.entrySet()) {
+                clonedMap.put(entry.getKey(), entry.getValue().clone());
+            }
+        }
+        if(provenanceRepositoryStorageUsage != null) {
+            final Map<String, StorageUsage> clonedMap = new LinkedHashMap<>();
+            clonedObj.setProvenanceRepositoryStorageUsage(clonedMap);
+            for (final Map.Entry<String, StorageUsage> entry : provenanceRepositoryStorageUsage.entrySet()) {
                 clonedMap.put(entry.getKey(), entry.getValue().clone());
             }
         }
@@ -212,6 +238,7 @@ public class SystemDiagnostics implements Cloneable {
         clonedObj.usedHeap = usedHeap;
         clonedObj.usedNonHeap = usedNonHeap;
         clonedObj.creationTimestamp = creationTimestamp;
+        clonedObj.uptime = uptime;
 
         return clonedObj;
     }

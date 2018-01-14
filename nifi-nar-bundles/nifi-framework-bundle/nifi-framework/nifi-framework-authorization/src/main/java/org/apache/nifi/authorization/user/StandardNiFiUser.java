@@ -16,41 +16,53 @@
  */
 package org.apache.nifi.authorization.user;
 
+import org.apache.commons.lang3.StringUtils;
+
+import java.util.Collections;
 import java.util.Objects;
+import java.util.Set;
 
 /**
  * An implementation of NiFiUser.
  */
 public class StandardNiFiUser implements NiFiUser {
 
-    public static final StandardNiFiUser ANONYMOUS = new StandardNiFiUser("anonymous");
+    public static final String ANONYMOUS_IDENTITY = "anonymous";
+    public static final StandardNiFiUser ANONYMOUS = new Builder().identity(ANONYMOUS_IDENTITY).anonymous(true).build();
 
     private final String identity;
+    private final Set<String> groups;
     private final NiFiUser chain;
     private final String clientAddress;
+    private final boolean isAnonymous;
 
-    public StandardNiFiUser(String identity) {
-        this(identity, null, null);
+    private StandardNiFiUser(final Builder builder) {
+        this.identity = builder.identity;
+        this.groups = builder.groups == null ? null : Collections.unmodifiableSet(builder.groups);
+        this.chain = builder.chain;
+        this.clientAddress = builder.clientAddress;
+        this.isAnonymous = builder.isAnonymous;
     }
 
-    public StandardNiFiUser(String identity, String clientAddress) {
-        this(identity, null, clientAddress);
+    /**
+     * This static builder allows the chain and clientAddress to be populated without allowing calling code to provide a non-anonymous identity of the anonymous user.
+     *
+     * @param chain the proxied entities in {@see NiFiUser} form
+     * @param clientAddress the address the request originated from
+     * @return an anonymous user instance with the identity "anonymous"
+     */
+    public static StandardNiFiUser populateAnonymousUser(NiFiUser chain, String clientAddress) {
+        return new Builder().identity(ANONYMOUS_IDENTITY).chain(chain).clientAddress(clientAddress).anonymous(true).build();
     }
-
-    public StandardNiFiUser(String identity, NiFiUser chain) {
-        this(identity, chain, null);
-    }
-
-    public StandardNiFiUser(String identity, NiFiUser chain, String clientAddress) {
-        this.identity = identity;
-        this.chain = chain;
-        this.clientAddress = clientAddress;
-    }
-
 
     @Override
     public String getIdentity() {
         return identity;
+    }
+
+    @Override
+    public Set<String> getGroups() {
+        return groups;
     }
 
     @Override
@@ -60,7 +72,7 @@ public class StandardNiFiUser implements NiFiUser {
 
     @Override
     public boolean isAnonymous() {
-        return this == ANONYMOUS;
+        return isAnonymous;
     }
 
     @Override
@@ -91,6 +103,87 @@ public class StandardNiFiUser implements NiFiUser {
 
     @Override
     public String toString() {
-        return String.format("identity[%s]", getIdentity());
+        final String formattedGroups;
+        if (groups == null) {
+            formattedGroups = "none";
+        } else {
+            formattedGroups = StringUtils.join(groups, ", ");
+        }
+
+        return String.format("identity[%s], groups[%s]", getIdentity(), formattedGroups);
+    }
+
+    /**
+     * Builder for a StandardNiFiUser
+     */
+    public static class Builder {
+
+        private String identity;
+        private Set<String> groups;
+        private NiFiUser chain;
+        private String clientAddress;
+        private boolean isAnonymous = false;
+
+        /**
+         * Sets the identity.
+         *
+         * @param identity the identity string for the user (i.e. "Andy" or "CN=alopresto, OU=Apache NiFi")
+         * @return the builder
+         */
+        public Builder identity(final String identity) {
+            this.identity = identity;
+            return this;
+        }
+
+        /**
+         * Sets the groups.
+         *
+         * @param groups the user groups
+         * @return the builder
+         */
+        public Builder groups(final Set<String> groups) {
+            this.groups = groups;
+            return this;
+        }
+
+        /**
+         * Sets the chain.
+         *
+         * @param chain the proxy chain that leads to this users
+         * @return the builder
+         */
+        public Builder chain(final NiFiUser chain) {
+            this.chain = chain;
+            return this;
+        }
+
+        /**
+         * Sets the client address.
+         *
+         * @param clientAddress the source address of the request
+         * @return the builder
+         */
+        public Builder clientAddress(final String clientAddress) {
+            this.clientAddress = clientAddress;
+            return this;
+        }
+
+        /**
+         * Sets whether this user is the canonical "anonymous" user
+         *
+         * @param isAnonymous true to represent the canonical "anonymous" user
+         * @return the builder
+         */
+        private Builder anonymous(final boolean isAnonymous) {
+            this.isAnonymous = isAnonymous;
+            return this;
+        }
+
+        /**
+         * @return builds a StandardNiFiUser from the current state of the builder
+         */
+        public StandardNiFiUser build() {
+            return new StandardNiFiUser(this);
+        }
     }
 }

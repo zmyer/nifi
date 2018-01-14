@@ -19,6 +19,7 @@ package org.apache.nifi.cluster.manager;
 
 import org.apache.nifi.controller.status.RunStatus;
 import org.apache.nifi.controller.status.TransmissionStatus;
+import org.apache.nifi.registry.flow.VersionedFlowState;
 import org.apache.nifi.util.FormatUtils;
 import org.apache.nifi.web.api.dto.CounterDTO;
 import org.apache.nifi.web.api.dto.CountersDTO;
@@ -61,6 +62,12 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public class StatusMerger {
+    private static final String ZERO_COUNT = "0";
+    private static final String ZERO_BYTES = "0 bytes";
+    private static final String ZERO_COUNT_AND_BYTES = "0 (0 bytes)";
+    private static final String EMPTY_COUNT = "-";
+    private static final String EMPTY_BYTES = "-";
+
     public static void merge(final ControllerStatusDTO target, final ControllerStatusDTO toMerge) {
         if (target == null || toMerge == null) {
             return;
@@ -114,6 +121,11 @@ public class StatusMerger {
         if (targetReadablePermission && !toMergeReadablePermission) {
             target.setId(toMerge.getId());
             target.setName(toMerge.getName());
+        }
+
+        // if the versioned flow state to merge is sync failure allow it to take precedence
+        if (VersionedFlowState.SYNC_FAILURE.name().equals(toMerge.getVersionedFlowState())) {
+            target.setVersionedFlowState(VersionedFlowState.SYNC_FAILURE.name());
         }
 
         target.setBytesIn(target.getBytesIn() + toMerge.getBytesIn());
@@ -355,6 +367,11 @@ public class StatusMerger {
         }
 
         merge(target.getAggregateSnapshot(), targetReadablePermission, toMerge.getAggregateSnapshot(), toMergeReadablePermission);
+
+        // ensure the aggregate snapshot was specified before promoting the runStatus to the status dto
+        if (target.getAggregateSnapshot() != null) {
+            target.setRunStatus(target.getAggregateSnapshot().getRunStatus());
+        }
 
         if (target.getNodeSnapshots() != null) {
             final NodeProcessorStatusSnapshotDTO nodeSnapshot = new NodeProcessorStatusSnapshotDTO();
@@ -602,6 +619,7 @@ public class StatusMerger {
         target.setUsedNonHeapBytes(target.getUsedNonHeapBytes() + toMerge.getUsedNonHeapBytes());
 
         merge(target.getContentRepositoryStorageUsage(), toMerge.getContentRepositoryStorageUsage());
+        merge(target.getProvenanceRepositoryStorageUsage(), toMerge.getProvenanceRepositoryStorageUsage());
         merge(target.getFlowFileRepositoryStorageUsage(), toMerge.getFlowFileRepositoryStorageUsage());
         mergeGarbageCollection(target.getGarbageCollection(), toMerge.getGarbageCollection());
 
@@ -743,14 +761,32 @@ public class StatusMerger {
     }
 
     public static String formatCount(final Integer intStatus) {
-        return intStatus == null ? "-" : FormatUtils.formatCount(intStatus);
+        if (intStatus == null) {
+            return EMPTY_COUNT;
+        }
+        if (intStatus == 0) {
+            return ZERO_COUNT;
+        }
+
+        return FormatUtils.formatCount(intStatus);
     }
 
     public static String formatDataSize(final Long longStatus) {
-        return longStatus == null ? "-" : FormatUtils.formatDataSize(longStatus);
+        if (longStatus == null) {
+            return EMPTY_BYTES;
+        }
+        if (longStatus == 0L) {
+            return ZERO_BYTES;
+        }
+
+        return FormatUtils.formatDataSize(longStatus);
     }
 
     public static String prettyPrint(final Integer count, final Long bytes) {
+        if (count != null && bytes != null && count == 0 && bytes == 0L) {
+            return ZERO_COUNT_AND_BYTES;
+        }
+
         return formatCount(count) + " (" + formatDataSize(bytes) + ")";
     }
 

@@ -18,6 +18,7 @@ package org.apache.nifi.distributed.cache.server;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -29,18 +30,22 @@ import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.commons.lang3.SerializationException;
 import org.apache.commons.lang3.SystemUtils;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.distributed.cache.client.AtomicCacheEntry;
 import org.apache.nifi.distributed.cache.client.Deserializer;
 import org.apache.nifi.distributed.cache.client.DistributedMapCacheClientService;
 import org.apache.nifi.distributed.cache.client.DistributedSetCacheClientService;
 import org.apache.nifi.distributed.cache.client.Serializer;
 import org.apache.nifi.distributed.cache.client.exception.DeserializationException;
 import org.apache.nifi.distributed.cache.server.map.DistributedMapCacheServer;
+import org.apache.nifi.distributed.cache.server.map.MapCacheServer;
 import org.apache.nifi.processor.Processor;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.remote.StandardVersionNegotiator;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.util.MockConfigurationContext;
 import org.apache.nifi.util.MockControllerServiceInitializationContext;
@@ -51,6 +56,8 @@ import org.junit.Test;
 import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import javax.net.ssl.SSLContext;
 
 public class TestServerAndClient {
 
@@ -68,13 +75,12 @@ public class TestServerAndClient {
 
     @Test
     public void testNonPersistentSetServerAndClient() throws InitializationException, IOException {
-
         /**
          * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
          * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
         Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
         // Create server
@@ -110,7 +116,7 @@ public class TestServerAndClient {
          * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
         Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
 
@@ -168,7 +174,7 @@ public class TestServerAndClient {
          * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
         Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
         // Create server
@@ -230,13 +236,110 @@ public class TestServerAndClient {
     }
 
     @Test
+    public void testPersistentMapServerAndClientWithLFUEvictions() throws InitializationException, IOException {
+        /**
+         * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
+         * See:  https://issues.apache.org/jira/browse/NIFI-437
+         */
+        Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+
+        LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
+        // Create server
+        final File dataFile = new File("target/cache-data");
+        deleteRecursively(dataFile);
+
+        // Create server
+        final TestRunner runner = TestRunners.newTestRunner(Mockito.mock(Processor.class));
+        final DistributedMapCacheServer server = new MapServer();
+        runner.addControllerService("server", server);
+        runner.setProperty(server, DistributedMapCacheServer.PERSISTENCE_PATH, dataFile.getAbsolutePath());
+        runner.setProperty(server, DistributedMapCacheServer.MAX_CACHE_ENTRIES, "3");
+        runner.setProperty(server, DistributedMapCacheServer.EVICTION_POLICY, DistributedMapCacheServer.EVICTION_STRATEGY_LFU);
+        runner.enableControllerService(server);
+
+        DistributedMapCacheClientService client = createMapClient(server.getPort());
+        final Serializer<String> serializer = new StringSerializer();
+        final boolean added = client.putIfAbsent("test", "1", serializer, serializer);
+        waitABit();
+        final boolean added2 = client.putIfAbsent("test2", "2", serializer, serializer);
+        waitABit();
+        final boolean added3 = client.putIfAbsent("test3", "3", serializer, serializer);
+        waitABit();
+        assertTrue(added);
+        assertTrue(added2);
+        assertTrue(added3);
+
+        final boolean contains = client.containsKey("test", serializer);
+        final boolean contains2 = client.containsKey("test2", serializer);
+        assertTrue(contains);
+        assertTrue(contains2);
+
+        final Deserializer<String> deserializer = new StringDeserializer();
+        final Set<String> keys = client.keySet(deserializer);
+        assertEquals(3, keys.size());
+        assertTrue(keys.contains("test"));
+        assertTrue(keys.contains("test2"));
+        assertTrue(keys.contains("test3"));
+
+        final boolean addedAgain = client.putIfAbsent("test", "1", serializer, serializer);
+        assertFalse(addedAgain);
+
+        final boolean added4 = client.putIfAbsent("test4", "4", serializer, serializer);
+        assertTrue(added4);
+
+        // ensure that added3 was evicted because it was used least frequently
+        assertFalse(client.containsKey("test3", serializer));
+
+        server.shutdownServer();
+
+        final DistributedMapCacheServer newServer = new MapServer();
+        runner.addControllerService("server2", newServer);
+        runner.setProperty(newServer, DistributedMapCacheServer.PERSISTENCE_PATH, dataFile.getAbsolutePath());
+        runner.enableControllerService(newServer);
+        client.close();
+        client = createMapClient(newServer.getPort());
+
+        assertTrue(client.containsKey("test", serializer));
+        assertTrue(client.containsKey("test2", serializer));
+        assertFalse(client.containsKey("test3", serializer));
+        assertTrue(client.containsKey("test4", serializer));
+
+        // Test removeByPattern, the first two should be removed and the last should remain
+        client.put("test.1", "1", serializer, serializer);
+        client.put("test.2", "2", serializer, serializer);
+        client.put("test3", "2", serializer, serializer);
+        final long removedTwo = client.removeByPattern("test\\..*");
+        assertEquals(2L, removedTwo);
+        assertFalse(client.containsKey("test.1", serializer));
+        assertFalse(client.containsKey("test.2", serializer));
+        assertTrue(client.containsKey("test3", serializer));
+
+        // test removeByPatternAndGet
+        client.put("test.1", "1", serializer, serializer);
+        client.put("test.2", "2", serializer, serializer);
+        Map<String,String> removed = client.removeByPatternAndGet("test\\..*", deserializer, deserializer);
+        assertEquals(2, removed.size());
+        assertTrue(removed.containsKey("test.1"));
+        assertTrue(removed.containsKey("test.2"));
+        assertFalse(client.containsKey("test.1", serializer));
+        assertFalse(client.containsKey("test.2", serializer));
+        assertTrue(client.containsKey("test3", serializer));
+        removed = client.removeByPatternAndGet("test\\..*", deserializer, deserializer);
+        assertEquals(0, removed.size());
+
+        newServer.shutdownServer();
+        client.close();
+    }
+
+    @Test
     public void testPersistentSetServerAndClientWithFIFOEvictions() throws InitializationException, IOException {
         /**
          * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
          * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
         Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
 
@@ -311,7 +414,7 @@ public class TestServerAndClient {
          * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
         Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
 
@@ -355,6 +458,26 @@ public class TestServerAndClient {
         assertTrue(removed);
         LOGGER.debug("end remove");
 
+        client.put("testKey", "testValue", keySerializer, valueSerializer);
+        assertTrue(client.containsKey("testKey", keySerializer));
+        String removedValue = client.removeAndGet("testKey", keySerializer, deserializer);
+        assertEquals("testValue", removedValue);
+        removedValue = client.removeAndGet("testKey", keySerializer, deserializer);
+        assertNull(removedValue);
+
+        final Set<String> keys = client.keySet(deserializer);
+        assertEquals(0, keys.size());
+
+        // Test removeByPattern, the first two should be removed and the last should remain
+        client.put("test.1", "1", keySerializer, keySerializer);
+        client.put("test.2", "2", keySerializer, keySerializer);
+        client.put("test3", "2", keySerializer, keySerializer);
+        final long removedTwo = client.removeByPattern("test\\..*");
+        assertEquals(2L, removedTwo);
+        assertFalse(client.containsKey("test.1", keySerializer));
+        assertFalse(client.containsKey("test.2", keySerializer));
+        assertTrue(client.containsKey("test3", keySerializer));
+
         final boolean containedAfterRemove = client.containsKey("testKey", keySerializer);
         assertFalse(containedAfterRemove);
 
@@ -366,9 +489,6 @@ public class TestServerAndClient {
         } catch (final Exception e) {
 
         }
-        client = null;
-        clientInitContext = null;
-        clientContext = null;
 
         DistributedMapCacheClientService client2 = new DistributedMapCacheClientService();
         MockControllerServiceInitializationContext clientInitContext2 = new MockControllerServiceInitializationContext(client2, "client2");
@@ -394,12 +514,12 @@ public class TestServerAndClient {
 
     @Test
     public void testClientTermination() throws InitializationException, IOException, InterruptedException {
-
         /**
-         * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug See: https://issues.apache.org/jira/browse/NIFI-437
+         * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
+         * See:  https://issues.apache.org/jira/browse/NIFI-437
          */
-        Assume.assumeFalse("testClientTermination is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
-            SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+        Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
 
         LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
         // Create server
@@ -450,6 +570,176 @@ public class TestServerAndClient {
         server.shutdownServer();
     }
 
+    @Test
+    public void testOptimisticLock() throws Exception {
+        /**
+         * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
+         * See:  https://issues.apache.org/jira/browse/NIFI-437
+         */
+        Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+
+        LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
+
+        // Create server
+        final DistributedMapCacheServer server = new MapServer();
+        final TestRunner runner = TestRunners.newTestRunner(Mockito.mock(Processor.class));
+        runner.addControllerService("server", server);
+        runner.enableControllerService(server);
+
+        DistributedMapCacheClientService client1 = new DistributedMapCacheClientService();
+        MockControllerServiceInitializationContext clientInitContext1 = new MockControllerServiceInitializationContext(client1, "client1");
+        client1.initialize(clientInitContext1);
+
+        DistributedMapCacheClientService client2 = new DistributedMapCacheClientService();
+        MockControllerServiceInitializationContext clientInitContext2 = new MockControllerServiceInitializationContext(client2, "client2");
+        client1.initialize(clientInitContext2);
+
+        final Map<PropertyDescriptor, String> clientProperties = new HashMap<>();
+        clientProperties.put(DistributedMapCacheClientService.HOSTNAME, "localhost");
+        clientProperties.put(DistributedMapCacheClientService.PORT, String.valueOf(server.getPort()));
+        clientProperties.put(DistributedMapCacheClientService.COMMUNICATIONS_TIMEOUT, "360 secs");
+
+        MockConfigurationContext clientContext1 = new MockConfigurationContext(clientProperties, clientInitContext1.getControllerServiceLookup());
+        client1.cacheConfig(clientContext1);
+        MockConfigurationContext clientContext2 = new MockConfigurationContext(clientProperties, clientInitContext2.getControllerServiceLookup());
+        client2.cacheConfig(clientContext2);
+
+        final Serializer<String> stringSerializer = new StringSerializer();
+        final Deserializer<String> stringDeserializer = new StringDeserializer();
+
+        final String key = "test-optimistic-lock";
+
+        // Ensure there's no existing key
+        assertFalse(client1.containsKey(key, stringSerializer));
+        assertNull(client1.fetch(key, stringSerializer, stringDeserializer));
+
+        // Client 1 inserts the key.
+        client1.put(key, "valueC1-0", stringSerializer, stringSerializer);
+
+        // Client 1 and 2 fetch the key
+        AtomicCacheEntry<String, String, Long> c1 = client1.fetch(key, stringSerializer, stringDeserializer);
+        AtomicCacheEntry<String, String, Long> c2 = client2.fetch(key, stringSerializer, stringDeserializer);
+        assertEquals(new Long(0), c1.getRevision().orElse(0L));
+        assertEquals("valueC1-0", c1.getValue());
+        assertEquals(new Long(0), c2.getRevision().orElse(0L));
+        assertEquals("valueC1-0", c2.getValue());
+
+        // Client 1 replace
+        c1.setValue("valueC1-1");
+        boolean c1Result = client1.replace(c1, stringSerializer, stringSerializer);
+        assertTrue("C1 should be able to replace the key", c1Result);
+        // Client 2 replace with the old revision
+        c2.setValue("valueC2-1");
+        boolean c2Result = client2.replace(c2, stringSerializer, stringSerializer);
+        assertFalse("C2 shouldn't be able to replace the key", c2Result);
+
+        // Client 2 fetch the key again
+        c2 = client2.fetch(key, stringSerializer, stringDeserializer);
+        assertEquals("valueC1-1", c2.getValue());
+        assertEquals(new Long(1), c2.getRevision().orElse(0L));
+
+        // Now, Client 2 knows the correct revision so it can replace the key
+        c2.setValue("valueC2-2");
+        c2Result = client2.replace(c2, stringSerializer, stringSerializer);
+        assertTrue("C2 should be able to replace the key", c2Result);
+
+        // Assert the cache
+        c2 = client2.fetch(key, stringSerializer, stringDeserializer);
+        assertEquals("valueC2-2", c2.getValue());
+        assertEquals(new Long(2), c2.getRevision().orElse(0L));
+
+        client1.close();
+        client2.close();
+        server.shutdownServer();
+    }
+
+    @Test
+    public void testBackwardCompatibility() throws Exception {
+        /**
+         * This bypasses the test for build environments in OS X running Java 1.8 due to a JVM bug
+         * See:  https://issues.apache.org/jira/browse/NIFI-437
+         */
+        Assume.assumeFalse("test is skipped due to build environment being OS X with JDK 1.8. See https://issues.apache.org/jira/browse/NIFI-437",
+                SystemUtils.IS_OS_MAC && SystemUtils.IS_JAVA_1_8);
+
+        LOGGER.info("Testing " + Thread.currentThread().getStackTrace()[1].getMethodName());
+
+        final TestRunner runner = TestRunners.newTestRunner(Mockito.mock(Processor.class));
+
+        // Create a server that only supports protocol version 1.
+        final DistributedMapCacheServer server = new MapServer() {
+            @Override
+            protected MapCacheServer createMapCacheServer(int port, int maxSize, SSLContext sslContext, EvictionPolicy evictionPolicy, File persistenceDir) throws IOException {
+                return new MapCacheServer(getIdentifier(), sslContext, port, maxSize, evictionPolicy, persistenceDir) {
+                    @Override
+                    protected StandardVersionNegotiator getVersionNegotiator() {
+                        return new StandardVersionNegotiator(1);
+                    }
+                };
+            }
+        };
+        runner.addControllerService("server", server);
+        runner.enableControllerService(server);
+
+        DistributedMapCacheClientService client = new DistributedMapCacheClientService();
+        MockControllerServiceInitializationContext clientInitContext1 = new MockControllerServiceInitializationContext(client, "client");
+        client.initialize(clientInitContext1);
+
+        final Map<PropertyDescriptor, String> clientProperties = new HashMap<>();
+        clientProperties.put(DistributedMapCacheClientService.HOSTNAME, "localhost");
+        clientProperties.put(DistributedMapCacheClientService.PORT, String.valueOf(server.getPort()));
+        clientProperties.put(DistributedMapCacheClientService.COMMUNICATIONS_TIMEOUT, "360 secs");
+
+        MockConfigurationContext clientContext = new MockConfigurationContext(clientProperties, clientInitContext1.getControllerServiceLookup());
+        client.cacheConfig(clientContext);
+
+        final Serializer<String> stringSerializer = new StringSerializer();
+        final Deserializer<String> stringDeserializer = new StringDeserializer();
+
+        final String key = "test-backward-compatibility";
+
+        // Version 1 operations should work
+        client.put(key, "value1", stringSerializer, stringSerializer);
+        assertEquals("value1", client.get(key, stringSerializer, stringDeserializer));
+
+        assertTrue(client.containsKey(key, stringSerializer));
+
+        try {
+            client.fetch(key, stringSerializer, stringDeserializer);
+            fail("Version 2 operations should NOT work.");
+        } catch (UnsupportedOperationException e) {
+        }
+
+        try {
+            AtomicCacheEntry<String,String,Long> entry = new AtomicCacheEntry<>(key, "value2", 0L);
+            client.replace(entry, stringSerializer, stringSerializer);
+            fail("Version 2 operations should NOT work.");
+        } catch (UnsupportedOperationException e) {
+        }
+
+        try {
+            Set<String> keys = client.keySet(stringDeserializer);
+            fail("Version 3 operations should NOT work.");
+        } catch (UnsupportedOperationException e) {
+        }
+
+        try {
+            String removed = client.removeAndGet("v.*", stringSerializer, stringDeserializer);
+            fail("Version 3 operations should NOT work.");
+        } catch (UnsupportedOperationException e) {
+        }
+
+        try {
+            Map<String, String> removed = client.removeByPatternAndGet("v.*", stringDeserializer, stringDeserializer);
+            fail("Version 3 operations should NOT work.");
+        } catch (UnsupportedOperationException e) {
+        }
+        client.close();
+        server.shutdownServer();
+    }
+
+
     private void waitABit() {
         try {
             Thread.sleep(10L);
@@ -467,6 +757,20 @@ public class TestServerAndClient {
         clientProperties.put(DistributedSetCacheClientService.PORT, String.valueOf(port));
         final MockConfigurationContext clientContext = new MockConfigurationContext(clientProperties, clientInitContext.getControllerServiceLookup());
         client.onConfigured(clientContext);
+
+        return client;
+    }
+
+    private DistributedMapCacheClientService createMapClient(final int port) throws InitializationException {
+        final DistributedMapCacheClientService client = new DistributedMapCacheClientService();
+        final MockControllerServiceInitializationContext clientInitContext = new MockControllerServiceInitializationContext(client, "client");
+        client.initialize(clientInitContext);
+
+        final Map<PropertyDescriptor, String> clientProperties = new HashMap<>();
+        clientProperties.put(DistributedMapCacheClientService.HOSTNAME, "localhost");
+        clientProperties.put(DistributedMapCacheClientService.PORT, String.valueOf(port));
+        final MockConfigurationContext clientContext = new MockConfigurationContext(clientProperties, clientInitContext.getControllerServiceLookup());
+        client.cacheConfig(clientContext);
 
         return client;
     }

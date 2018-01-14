@@ -34,6 +34,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.util.Collections;
 import java.util.List;
@@ -112,6 +114,13 @@ public class TlsToolkitStandaloneCommandLineTest {
         String testSigningAlgorithm = "testSigningAlgorithm";
         tlsToolkitStandaloneCommandLine.parse("-s", testSigningAlgorithm);
         assertEquals(testSigningAlgorithm, tlsToolkitStandaloneCommandLine.createConfig().getSigningAlgorithm());
+    }
+
+    @Test
+    public void testSAN() throws CommandLineParseException, IOException {
+        String dnsSAN = "nifi.apache.org";
+        tlsToolkitStandaloneCommandLine.parse("--subjectAlternativeNames", dnsSAN);
+        assertEquals(dnsSAN, tlsToolkitStandaloneCommandLine.createConfig().getDomainAlternativeNames());
     }
 
     @Test
@@ -412,6 +421,20 @@ public class TlsToolkitStandaloneCommandLineTest {
     @Test(expected = IllegalArgumentException.class)
     public void testBadGlobalOrder() throws CommandLineParseException {
         tlsToolkitStandaloneCommandLine.parse("-n", "notInGlobalOrder", "-G", "nifi[1-3]");
+    }
+
+    @Test
+    public void testDefaultOutputPathRoot() {
+        Path root = Paths.get(".").toAbsolutePath().getRoot().resolve(".");
+        String calculateDefaultOutputDirectory = TlsToolkitStandaloneCommandLine.calculateDefaultOutputDirectory(root);
+        assertEquals(root.toAbsolutePath().getRoot().toString(), calculateDefaultOutputDirectory);
+    }
+
+    @Test
+    public void testDefaultOutputPath() {
+        Path path = Paths.get(".");
+        String calculateDefaultOutputDirectory = TlsToolkitStandaloneCommandLine.calculateDefaultOutputDirectory(path);
+        assertEquals("../" + path.toAbsolutePath().normalize().getFileName().toString(), calculateDefaultOutputDirectory);
     }
 
     private Properties getProperties() throws IOException {

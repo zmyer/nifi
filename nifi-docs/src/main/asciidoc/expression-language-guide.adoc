@@ -14,14 +14,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-Apache NiFi Expression Language Guide
-=====================================
+= Apache NiFi Expression Language Guide
 Apache NiFi Team <dev@nifi.apache.org>
 :homepage: http://nifi.apache.org
 
 [[overview]]
-Overview
---------
+== Overview
 All data in Apache NiFi is represented by an abstraction called a FlowFile.
 A FlowFile is comprised of two major pieces: content and attributes.
 The content portion of the FlowFile represents the data on which to operate.
@@ -48,8 +46,7 @@ and manipulate their values.
 
 
 [[structure]]
-Structure of a NiFi Expression
-------------------------------
+== Structure of a NiFi Expression
 
 The NiFi Expression Language always begins with the start delimiter `${` and ends
 with the end delimiter `}`. Between the start and end delimiters is the text of the
@@ -265,8 +262,8 @@ subject exists and `false` otherwise.#
 
 [.function]
 === isEmpty
-*Description*: [.description]#The `isEmpty` function returns `true` if the Subject is null or contains only white-space
-	(new line, carriage return, space, tab), `false` otherwise.#
+*Description*: [.description]#The `isEmpty` function returns `true` if the Subject is null, does not contain any characters 
+	or contains only white-space (new line, carriage return, space, tab), `false` otherwise.#
 
 *Subject Type*: [.subject]#String#
 
@@ -275,7 +272,7 @@ subject exists and `false` otherwise.#
 *Return Type*: [.returnType]#Boolean#
 
 *Examples*: `${filename:isEmpty()}` returns `true` if the "filename" attribute does not exist or contains only
-	white space.
+	white space. `${literal(" "):isEmpty()}` returns true as well as `${literal(""):isEmpty()}`.
 
 
 
@@ -1754,13 +1751,15 @@ In order to run the correct method, the parameter types must be correct. The Exp
 
 *Description*: [.description]#Formats a number as a date/time according to the format specified by the argument. The argument
 	must be a String that is a valid Java SimpleDateFormat format. The Subject is expected to be a Number that
-	represents the number of milliseconds since Midnight GMT on January 1, 1970.#
+	represents the number of milliseconds since Midnight GMT on January 1, 1970. The number will be evaluated using the local 
+	time zone unless specified in the second optional argument.#
 
 *Subject Type*: [.subject]#Number#
 
 *Arguments*:
 
 	- [.argName]#_format_# : [.argDesc]#The format to use in the Java SimpleDateFormat syntax#
+	- [.argName]#_time zone_# : [.argDesc]#Optional argument that specifies the time zone to use (in the Java TimeZone syntax)#
 
 *Return Type*: [.returnType]#String#
 
@@ -1770,10 +1769,12 @@ In order to run the correct method, the parameter types must be correct. The Exp
 .format Examples
 |============================================================================
 | Expression | Value
-| `${time:format("yyyy/MM/dd HH:mm:ss.SSS'Z'")}` | `2014/12/31 15:36:03.264Z`
-| `${time:format("yyyy/MM/dd")}` | `2014/12/31`
-| `${time:format("HH:mm:ss.SSS'Z'")}` | `15:36:03.264Z`
-| `${time:format("2014")}` | `2014`
+| `${time:format("yyyy/MM/dd HH:mm:ss.SSS'Z'", "GMT")}` | `2014/12/31 20:36:03.264Z`
+| `${time:format("yyyy/MM/dd HH:mm:ss.SSS'Z'", "America/Los_Angeles")}` | `2014/12/31 12:36:03.264Z`
+| `${time:format("yyyy/MM/dd HH:mm:ss.SSS'Z'", "Asia/Tokyo")}` | `2015/01/01 05:36:03.264Z`
+| `${time:format("yyyy/MM/dd", "GMT")}` | `2014/12/31`
+| `${time:format("HH:mm:ss.SSS'Z'", "GMT")}` | `20:36:03.264Z`
+| `${time:format("yyyy", "GMT")}` | `2014`
 |============================================================================
 
 
@@ -1785,20 +1786,21 @@ In order to run the correct method, the parameter types must be correct. The Exp
 
 *Description*: [.description]#Converts a String into a Date data type, based on the format specified by the argument. The argument
 	must be a String that is a valid Java SimpleDateFormat syntax. The Subject is expected to be a String that is formatted
-	according the argument.#
+	according the argument. The date will be evaluated using the local time zone unless specified in the second optional argument.#
 
 *Subject Type*: [.subject]#String#
 
 *Arguments*:
 
 		- [.argName]#_format_# : [.argDesc]#The current format to use when parsing the Subject, in the Java SimpleDateFormat syntax.#
+		- [.argName]#_time zone_# : [.argDesc]#Optional argument that specifies the time zone to use when parsing the Subject, in the Java TimeZone syntax.#
 
 
 *Return Type*: [.returnType]#Date#
 
 *Examples*: If the attribute "year" has the value "2014" and the attribute "time" has the value "2014/12/31 15:36:03.264Z",
-	then the Expression `${year:toDate('yyyy')}` will return a Date data type with a value representing Midnight GMT on
-	January 1, 2014. The Expression `${time:toDate("yyyy/MM/dd HH:mm:ss.SSS'Z'")}` will result in a Date data type for
+	then the Expression `${year:toDate('yyyy', 'GMT')}` will return a Date data type with a value representing Midnight GMT on
+	January 1, 2014. The Expression `${time:toDate("yyyy/MM/dd HH:mm:ss.SSS'Z'", "GMT")}` will result in a Date data type for
 	15:36:03.264 GMT on December 31, 2014.
 
 Often, this function is used in conjunction with the <<format>> function to change the format of a date/time. For example,
@@ -2061,7 +2063,7 @@ provides several functions for evaluating the same conditions against groups of 
 [.function]
 === allAttributes
 
-*Description*: [.description]#Checks to see if any of the given attributes, match the given condition. This function has no subject and takes one or more
+*Description*: [.description]#Checks to see if all of the given attributes match the given condition. This function has no subject and takes one or more
 	arguments that are the names of attributes to which the remainder of the Expression is to be applied. If all of the attributes specified,
 	when evaluated against the rest of the Expression, returns a value of `true`, then this function will return `true`. Otherwise, this function
 	will return `false`.#

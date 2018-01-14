@@ -16,48 +16,18 @@
  */
 package org.apache.nifi.processors.standard;
 
-import static org.apache.commons.lang3.StringUtils.trimToEmpty;
-
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.InetSocketAddress;
-import java.net.Proxy;
-import java.net.Proxy.Type;
-import java.net.URL;
-import java.nio.charset.Charset;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-
-import javax.net.ssl.HostnameVerifier;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLSession;
-
 import com.burgstaller.okhttp.AuthenticationCacheInterceptor;
 import com.burgstaller.okhttp.CachingAuthenticatorDecorator;
 import com.burgstaller.okhttp.digest.CachingAuthenticator;
 import com.burgstaller.okhttp.digest.DigestAuthenticator;
-import com.squareup.okhttp.MediaType;
-import com.squareup.okhttp.OkHttpClient;
-import com.squareup.okhttp.Request;
-import com.squareup.okhttp.RequestBody;
-import com.squareup.okhttp.Response;
-import com.squareup.okhttp.ResponseBody;
-
+import okhttp3.Credentials;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import okhttp3.internal.tls.OkHostnameVerifier;
 import okio.BufferedSink;
 import org.apache.commons.io.input.TeeInputStream;
 import org.apache.commons.lang3.StringUtils;
@@ -83,7 +53,7 @@ import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
-import org.apache.nifi.processors.standard.util.MultiAuthenticator;
+import org.apache.nifi.processors.standard.util.ProxyAuthenticator;
 import org.apache.nifi.processors.standard.util.SoftLimitBoundedByteArrayOutputStream;
 import org.apache.nifi.ssl.SSLContextService;
 import org.apache.nifi.ssl.SSLContextService.ClientAuth;
@@ -91,11 +61,54 @@ import org.apache.nifi.stream.io.StreamUtils;
 import org.joda.time.format.DateTimeFormat;
 import org.joda.time.format.DateTimeFormatter;
 
+import javax.net.ssl.HostnameVerifier;
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSession;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.TrustManagerFactory;
+import javax.net.ssl.X509TrustManager;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
+import java.net.Proxy.Type;
+import java.net.URL;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyManagementException;
+import java.security.KeyStore;
+import java.security.KeyStoreException;
+import java.security.NoSuchAlgorithmException;
+import java.security.UnrecoverableKeyException;
+import java.security.cert.CertificateException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static org.apache.commons.lang3.StringUtils.trimToEmpty;
+
 @SupportsBatching
 @Tags({"http", "https", "rest", "client"})
 @InputRequirement(Requirement.INPUT_ALLOWED)
 @CapabilityDescription("An HTTP client processor which can interact with a configurable HTTP Endpoint. The destination URL and HTTP Method are configurable."
-    + " FlowFile attributes are converted to HTTP headers and the FlowFile contents are included as the body of the request (if the HTTP Method is PUT or POST).")
+    + " FlowFile attributes are converted to HTTP headers and the FlowFile contents are included as the body of the request (if the HTTP Method is PUT, POST or PATCH).")
 @WritesAttributes({
     @WritesAttribute(attribute = "invokehttp.status.code", description = "The status code that is returned"),
     @WritesAttribute(attribute = "invokehttp.status.message", description = "The status message that is returned"),
@@ -104,6 +117,8 @@ import org.joda.time.format.DateTimeFormatter;
     @WritesAttribute(attribute = "invokehttp.request.url", description = "The request URL"),
     @WritesAttribute(attribute = "invokehttp.tx.id", description = "The transaction ID that is returned after reading the response"),
     @WritesAttribute(attribute = "invokehttp.remote.dn", description = "The DN of the remote server"),
+    @WritesAttribute(attribute = "invokehttp.java.exception.class", description = "The Java exception class raised when the processor fails"),
+    @WritesAttribute(attribute = "invokehttp.java.exception.message", description = "The Java exception message raised when the processor fails"),
     @WritesAttribute(attribute = "user-defined", description = "If the 'Put Response Body In Attribute' property is set then whatever it is set to "
         + "will become the attribute key and the value would be the body of the HTTP response.")})
 @DynamicProperty(name = "Header Name", value = "Attribute Expression Language", supportsExpressionLanguage = true, description = "Send request header "
@@ -118,6 +133,9 @@ public final class InvokeHTTP extends AbstractProcessor {
     public final static String REQUEST_URL = "invokehttp.request.url";
     public final static String TRANSACTION_ID = "invokehttp.tx.id";
     public final static String REMOTE_DN = "invokehttp.remote.dn";
+    public final static String EXCEPTION_CLASS = "invokehttp.java.exception.class";
+    public final static String EXCEPTION_MESSAGE = "invokehttp.java.exception.message";
+
 
     public static final String DEFAULT_CONTENT_TYPE = "application/octet-stream";
 
@@ -127,13 +145,14 @@ public final class InvokeHTTP extends AbstractProcessor {
     // attributes.
     public static final Set<String> IGNORED_ATTRIBUTES = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
             STATUS_CODE, STATUS_MESSAGE, RESPONSE_BODY, REQUEST_URL, TRANSACTION_ID, REMOTE_DN,
+            EXCEPTION_CLASS, EXCEPTION_MESSAGE,
             "uuid", "filename", "path")));
 
     // properties
     public static final PropertyDescriptor PROP_METHOD = new PropertyDescriptor.Builder()
             .name("HTTP Method")
-            .description("HTTP request method (GET, POST, PUT, DELETE, HEAD, OPTIONS). Arbitrary methods are also supported. "
-                + "Methods other than POST and PUT will be sent without a message body.")
+            .description("HTTP request method (GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS). Arbitrary methods are also supported. "
+                + "Methods other than POST, PUT and PATCH will be sent without a message body.")
             .required(true)
             .defaultValue("GET")
             .expressionLanguageSupported(true)
@@ -204,6 +223,7 @@ public final class InvokeHTTP extends AbstractProcessor {
             .description("The fully qualified hostname or IP address of the proxy server")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor PROP_PROXY_PORT = new PropertyDescriptor.Builder()
@@ -211,6 +231,7 @@ public final class InvokeHTTP extends AbstractProcessor {
             .description("The port of the proxy server")
             .required(false)
             .addValidator(StandardValidators.PORT_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor PROP_PROXY_USER = new PropertyDescriptor.Builder()
@@ -219,6 +240,7 @@ public final class InvokeHTTP extends AbstractProcessor {
             .description("Username to set when authenticating against proxy")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor PROP_PROXY_PASSWORD = new PropertyDescriptor.Builder()
@@ -228,22 +250,23 @@ public final class InvokeHTTP extends AbstractProcessor {
             .required(false)
             .sensitive(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor PROP_CONTENT_TYPE = new PropertyDescriptor.Builder()
-        .name("Content-Type")
-        .description("The Content-Type to specify for when content is being transmitted through a PUT or POST. "
-            + "In the case of an empty value after evaluating an expression language expression, Content-Type defaults to " + DEFAULT_CONTENT_TYPE)
-        .required(true)
-        .expressionLanguageSupported(true)
-        .defaultValue("${" + CoreAttributes.MIME_TYPE.key() + "}")
-        .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(AttributeExpression.ResultType.STRING))
-        .build();
+            .name("Content-Type")
+            .description("The Content-Type to specify for when content is being transmitted through a PUT, POST or PATCH. "
+                    + "In the case of an empty value after evaluating an expression language expression, Content-Type defaults to " + DEFAULT_CONTENT_TYPE)
+            .required(true)
+            .expressionLanguageSupported(true)
+            .defaultValue("${" + CoreAttributes.MIME_TYPE.key() + "}")
+            .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(AttributeExpression.ResultType.STRING))
+            .build();
 
     public static final PropertyDescriptor PROP_SEND_BODY = new PropertyDescriptor.Builder()
             .name("send-message-body")
             .displayName("Send Message Body")
-            .description("If true, sends the HTTP message body on POST/PUT requests (default).  If false, suppresses the message body and content-type header for these requests.")
+            .description("If true, sends the HTTP message body on POST/PUT/PATCH requests (default).  If false, suppresses the message body and content-type header for these requests.")
             .defaultValue("true")
             .allowableValues("true", "false")
             .required(false)
@@ -337,7 +360,7 @@ public final class InvokeHTTP extends AbstractProcessor {
 
     public static final PropertyDescriptor PROP_USE_CHUNKED_ENCODING = new PropertyDescriptor.Builder()
             .name("Use Chunked Encoding")
-            .description("When POST'ing or PUT'ing content set this property to true in order to not pass the 'Content-length' header and instead send 'Transfer-Encoding' with "
+            .description("When POST'ing, PUT'ing or PATCH'ing content set this property to true in order to not pass the 'Content-length' header and instead send 'Transfer-Encoding' with "
                     + "a value of 'chunked'. This will enable the data transfer mechanism which was introduced in HTTP 1.1 to pass data of unknown lengths in chunks.")
             .required(true)
             .defaultValue("false")
@@ -460,7 +483,7 @@ public final class InvokeHTTP extends AbstractProcessor {
         } else {
             // compile the attributes-to-send filter pattern
             if (PROP_ATTRIBUTES_TO_SEND.getName().equalsIgnoreCase(descriptor.getName())) {
-                if (newValue.isEmpty()) {
+                if (newValue == null || newValue.isEmpty()) {
                     regexAttributesToSend = null;
                 } else {
                     final String trimmedValue = StringUtils.trimToEmpty(newValue);
@@ -494,84 +517,146 @@ public final class InvokeHTTP extends AbstractProcessor {
     }
 
     @OnScheduled
-    public void setUpClient(final ProcessContext context) throws IOException {
+    public void setUpClient(final ProcessContext context) throws IOException, UnrecoverableKeyException, CertificateException, NoSuchAlgorithmException, KeyStoreException, KeyManagementException {
         okHttpClientAtomicReference.set(null);
 
-        OkHttpClient okHttpClient = new OkHttpClient();
+        OkHttpClient.Builder okHttpClientBuilder = new OkHttpClient().newBuilder();
 
         // Add a proxy if set
-        final String proxyHost = context.getProperty(PROP_PROXY_HOST).getValue();
-        final Integer proxyPort = context.getProperty(PROP_PROXY_PORT).asInteger();
+        final String proxyHost = context.getProperty(PROP_PROXY_HOST).evaluateAttributeExpressions().getValue();
+        final Integer proxyPort = context.getProperty(PROP_PROXY_PORT).evaluateAttributeExpressions().asInteger();
         if (proxyHost != null && proxyPort != null) {
             final Proxy proxy = new Proxy(Type.HTTP, new InetSocketAddress(proxyHost, proxyPort));
-            okHttpClient.setProxy(proxy);
+            okHttpClientBuilder.proxy(proxy);
         }
 
         // Set timeouts
-        okHttpClient.setConnectTimeout((context.getProperty(PROP_CONNECT_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue()), TimeUnit.MILLISECONDS);
-        okHttpClient.setReadTimeout(context.getProperty(PROP_READ_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue(), TimeUnit.MILLISECONDS);
+        okHttpClientBuilder.connectTimeout((context.getProperty(PROP_CONNECT_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue()), TimeUnit.MILLISECONDS);
+        okHttpClientBuilder.readTimeout(context.getProperty(PROP_READ_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue(), TimeUnit.MILLISECONDS);
 
         // Set whether to follow redirects
-        okHttpClient.setFollowRedirects(context.getProperty(PROP_FOLLOW_REDIRECTS).asBoolean());
+        okHttpClientBuilder.followRedirects(context.getProperty(PROP_FOLLOW_REDIRECTS).asBoolean());
 
         final SSLContextService sslService = context.getProperty(PROP_SSL_CONTEXT_SERVICE).asControllerService(SSLContextService.class);
         final SSLContext sslContext = sslService == null ? null : sslService.createSSLContext(ClientAuth.NONE);
 
         // check if the ssl context is set and add the factory if so
         if (sslContext != null) {
-            okHttpClient.setSslSocketFactory(sslContext.getSocketFactory());
+            setSslSocketFactory(okHttpClientBuilder, sslService, sslContext);
         }
 
         // check the trusted hostname property and override the HostnameVerifier
         String trustedHostname = trimToEmpty(context.getProperty(PROP_TRUSTED_HOSTNAME).getValue());
         if (!trustedHostname.isEmpty()) {
-            okHttpClient.setHostnameVerifier(new OverrideHostnameVerifier(trustedHostname, okHttpClient.getHostnameVerifier()));
+            okHttpClientBuilder.hostnameVerifier(new OverrideHostnameVerifier(trustedHostname, OkHostnameVerifier.INSTANCE));
         }
 
-        setAuthenticator(okHttpClient, context);
+        setAuthenticator(okHttpClientBuilder, context);
 
         useChunked = context.getProperty(PROP_USE_CHUNKED_ENCODING).asBoolean();
 
-        okHttpClientAtomicReference.set(okHttpClient);
+        okHttpClientAtomicReference.set(okHttpClientBuilder.build());
     }
 
-    private void setAuthenticator(OkHttpClient okHttpClient, ProcessContext context) {
+    /*
+        Overall, this method is based off of examples from OkHttp3 documentation:
+            https://square.github.io/okhttp/3.x/okhttp/okhttp3/OkHttpClient.Builder.html#sslSocketFactory-javax.net.ssl.SSLSocketFactory-javax.net.ssl.X509TrustManager-
+            https://github.com/square/okhttp/blob/master/samples/guide/src/main/java/okhttp3/recipes/CustomTrust.java#L156
+
+        In-depth documentation on Java Secure Socket Extension (JSSE) Classes and interfaces:
+            https://docs.oracle.com/javase/8/docs/technotes/guides/security/jsse/JSSERefGuide.html#JSSEClasses
+     */
+    private void setSslSocketFactory(OkHttpClient.Builder okHttpClientBuilder, SSLContextService sslService, SSLContext sslContext)
+            throws IOException, KeyStoreException, CertificateException, NoSuchAlgorithmException, UnrecoverableKeyException, KeyManagementException {
+
+        final KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+        final TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance("X509");
+        // initialize the KeyManager array to null and we will overwrite later if a keystore is loaded
+        KeyManager[] keyManagers = null;
+
+        // we will only initialize the keystore if properties have been supplied by the SSLContextService
+        if (sslService.isKeyStoreConfigured()) {
+            final String keystoreLocation = sslService.getKeyStoreFile();
+            final String keystorePass = sslService.getKeyStorePassword();
+            final String keystoreType = sslService.getKeyStoreType();
+
+            // prepare the keystore
+            final KeyStore keyStore = KeyStore.getInstance(keystoreType);
+
+            try (FileInputStream keyStoreStream = new FileInputStream(keystoreLocation)) {
+                keyStore.load(keyStoreStream, keystorePass.toCharArray());
+            }
+
+            keyManagerFactory.init(keyStore, keystorePass.toCharArray());
+            keyManagers = keyManagerFactory.getKeyManagers();
+        }
+
+        // we will only initialize the truststure if properties have been supplied by the SSLContextService
+        if (sslService.isTrustStoreConfigured()) {
+            // load truststore
+            final String truststoreLocation = sslService.getTrustStoreFile();
+            final String truststorePass = sslService.getTrustStorePassword();
+            final String truststoreType = sslService.getTrustStoreType();
+
+            KeyStore truststore = KeyStore.getInstance(truststoreType);
+            truststore.load(new FileInputStream(truststoreLocation), truststorePass.toCharArray());
+            trustManagerFactory.init(truststore);
+        }
+
+         /*
+            TrustManagerFactory.getTrustManagers returns a trust manager for each type of trust material. Since we are getting a trust manager factory that uses "X509"
+            as it's trust management algorithm, we are able to grab the first (and thus the most preferred) and use it as our x509 Trust Manager
+
+            https://docs.oracle.com/javase/8/docs/api/javax/net/ssl/TrustManagerFactory.html#getTrustManagers--
+         */
+        final X509TrustManager x509TrustManager;
+        TrustManager[] trustManagers = trustManagerFactory.getTrustManagers();
+        if (trustManagers[0] != null) {
+            x509TrustManager = (X509TrustManager) trustManagers[0];
+        } else {
+            throw new IllegalStateException("List of trust managers is null");
+        }
+
+        // if keystore properties were not supplied, the keyManagers array will be null
+        sslContext.init(keyManagers, trustManagerFactory.getTrustManagers(), null);
+
+        final SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+        okHttpClientBuilder.sslSocketFactory(sslSocketFactory, x509TrustManager);
+    }
+
+    private void setAuthenticator(OkHttpClient.Builder okHttpClientBuilder, ProcessContext context) {
         final String authUser = trimToEmpty(context.getProperty(PROP_BASIC_AUTH_USERNAME).getValue());
-        final String proxyUsername = trimToEmpty(context.getProperty(PROP_PROXY_USER).getValue());
+        final String proxyUsername = trimToEmpty(context.getProperty(PROP_PROXY_USER).evaluateAttributeExpressions().getValue());
 
         // If the username/password properties are set then check if digest auth is being used
         if (!authUser.isEmpty() && "true".equalsIgnoreCase(context.getProperty(PROP_DIGEST_AUTH).getValue())) {
             final String authPass = trimToEmpty(context.getProperty(PROP_BASIC_AUTH_PASSWORD).getValue());
 
             /*
-             * Currently OkHttp doesn't have built-in Digest Auth Support. The ticket for adding it is here:
-             * https://github.com/square/okhttp/issues/205#issuecomment-154047052
-             * Once added this should be refactored to use the built in support. For now, a third party lib is needed.
+             * OkHttp doesn't have built-in Digest Auth Support. A ticket for adding it is here[1] but they authors decided instead to rely on a 3rd party lib.
+             *
+             * [1] https://github.com/square/okhttp/issues/205#issuecomment-154047052
              */
             final Map<String, CachingAuthenticator> authCache = new ConcurrentHashMap<>();
             com.burgstaller.okhttp.digest.Credentials credentials = new com.burgstaller.okhttp.digest.Credentials(authUser, authPass);
             final DigestAuthenticator digestAuthenticator = new DigestAuthenticator(credentials);
 
-            MultiAuthenticator authenticator = new MultiAuthenticator.Builder()
-                    .with("Digest", digestAuthenticator)
-                    .build();
-
             if(!proxyUsername.isEmpty()) {
-                final String proxyPassword = context.getProperty(PROP_PROXY_PASSWORD).getValue();
-                authenticator.setProxyUsername(proxyUsername);
-                authenticator.setProxyPassword(proxyPassword);
+                final String proxyPassword = context.getProperty(PROP_PROXY_PASSWORD).evaluateAttributeExpressions().getValue();
+                ProxyAuthenticator proxyAuthenticator = new ProxyAuthenticator(proxyUsername, proxyPassword);
+
+                okHttpClientBuilder.proxyAuthenticator(proxyAuthenticator);
             }
 
-            okHttpClient.interceptors().add(new AuthenticationCacheInterceptor(authCache));
-            okHttpClient.setAuthenticator(new CachingAuthenticatorDecorator(authenticator, authCache));
+            okHttpClientBuilder.interceptors().add(new AuthenticationCacheInterceptor(authCache));
+            okHttpClientBuilder.authenticator(new CachingAuthenticatorDecorator(digestAuthenticator, authCache));
         } else {
             // Add proxy authentication only
             if(!proxyUsername.isEmpty()) {
-                final String proxyPassword = context.getProperty(PROP_PROXY_PASSWORD).getValue();
-                MultiAuthenticator authenticator = new MultiAuthenticator.Builder().build();
-                authenticator.setProxyUsername(proxyUsername);
-                authenticator.setProxyPassword(proxyPassword);
-                okHttpClient.setAuthenticator(authenticator);
+                final String proxyPassword = context.getProperty(PROP_PROXY_PASSWORD).evaluateAttributeExpressions().getValue();
+                ProxyAuthenticator proxyAuthenticator = new ProxyAuthenticator(proxyUsername, proxyPassword);
+
+                okHttpClientBuilder.proxyAuthenticator(proxyAuthenticator);
             }
         }
     }
@@ -590,7 +675,7 @@ public final class InvokeHTTP extends AbstractProcessor {
             }
 
             String request = context.getProperty(PROP_METHOD).evaluateAttributeExpressions().getValue().toUpperCase();
-            if ("POST".equals(request) || "PUT".equals(request)) {
+            if ("POST".equals(request) || "PUT".equals(request) || "PATCH".equals(request)) {
                 return;
             } else if (putToAttribute) {
                 requestFlowFile = session.create();
@@ -753,6 +838,8 @@ public final class InvokeHTTP extends AbstractProcessor {
             if (requestFlowFile != null) {
                 logger.error("Routing to {} due to exception: {}", new Object[]{REL_FAILURE.getName(), e}, e);
                 requestFlowFile = session.penalize(requestFlowFile);
+                requestFlowFile = session.putAttribute(requestFlowFile, EXCEPTION_CLASS, e.getClass().getName());
+                requestFlowFile = session.putAttribute(requestFlowFile, EXCEPTION_MESSAGE, e.getMessage());
                 // transfer original to failure
                 session.transfer(requestFlowFile, REL_FAILURE);
             } else {
@@ -783,7 +870,7 @@ public final class InvokeHTTP extends AbstractProcessor {
         if (!authUser.isEmpty() && "false".equalsIgnoreCase(context.getProperty(PROP_DIGEST_AUTH).getValue())) {
             final String authPass = trimToEmpty(context.getProperty(PROP_BASIC_AUTH_PASSWORD).getValue());
 
-            String credential = com.squareup.okhttp.Credentials.basic(authUser, authPass);
+            String credential = Credentials.basic(authUser, authPass);
             requestBuilder = requestBuilder.header("Authorization", credential);
         }
 
@@ -800,6 +887,10 @@ public final class InvokeHTTP extends AbstractProcessor {
             case "PUT":
                 requestBody = getRequestBodyToSend(session, context, requestFlowFile);
                 requestBuilder = requestBuilder.put(requestBody);
+                break;
+            case "PATCH":
+                requestBody = getRequestBodyToSend(session, context, requestFlowFile);
+                requestBuilder = requestBuilder.patch(requestBody);
                 break;
             case "HEAD":
                 requestBuilder = requestBuilder.head();
@@ -855,7 +946,7 @@ public final class InvokeHTTP extends AbstractProcessor {
         // iterate through the flowfile attributes, adding any attribute that
         // matches the attributes-to-send pattern. if the pattern is not set
         // (it's an optional property), ignore that attribute entirely
-        if (regexAttributesToSend != null) {
+        if (regexAttributesToSend != null && requestFlowFile != null) {
             Map<String, String> attributes = requestFlowFile.getAttributes();
             Matcher m = regexAttributesToSend.matcher("");
             for (Map.Entry<String, String> entry : attributes.entrySet()) {
@@ -928,7 +1019,7 @@ public final class InvokeHTTP extends AbstractProcessor {
 
     private void logRequest(ComponentLog logger, Request request) {
         logger.debug("\nRequest to remote service:\n\t{}\n{}",
-                new Object[]{request.url().toExternalForm(), getLogString(request.headers().toMultimap())});
+                new Object[]{request.url().url().toExternalForm(), getLogString(request.headers().toMultimap())});
     }
 
     private void logResponse(ComponentLog logger, URL url, Response response) {
@@ -989,25 +1080,24 @@ public final class InvokeHTTP extends AbstractProcessor {
     private Map<String, String> convertAttributesFromHeaders(URL url, Response responseHttp){
         // create a new hashmap to store the values from the connection
         Map<String, String> map = new HashMap<>();
-        for (Map.Entry<String, List<String>> entry : responseHttp.headers().toMultimap().entrySet()) {
-            String key = entry.getKey();
-            if (key == null) {
-                continue;
-            }
+        responseHttp.headers().names().forEach( (key) -> {
+                if (key == null) {
+                    return;
+                }
 
-            List<String> values = entry.getValue();
+                List<String> values = responseHttp.headers().values(key);
 
-            // we ignore any headers with no actual values (rare)
-            if (values == null || values.isEmpty()) {
-                continue;
-            }
+                // we ignore any headers with no actual values (rare)
+                if (values == null || values.isEmpty()) {
+                    return;
+                }
 
-            // create a comma separated string from the values, this is stored in the map
-            String value = csv(values);
+                // create a comma separated string from the values, this is stored in the map
+                String value = csv(values);
 
-            // put the csv into the map
-            map.put(key, value);
-        }
+                // put the csv into the map
+                map.put(key, value);
+        });
 
         if ("HTTPS".equals(url.getProtocol().toUpperCase())) {
             map.put(REMOTE_DN, responseHttp.handshake().peerPrincipal().getName());

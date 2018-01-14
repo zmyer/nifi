@@ -18,12 +18,13 @@
  */
 package org.apache.nifi.processors.mongodb;
 
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.google.common.collect.Lists;
+import com.mongodb.MongoClient;
+import com.mongodb.MongoClientURI;
+import com.mongodb.client.MongoCollection;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.MockProcessContext;
@@ -36,10 +37,13 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
-import com.google.common.collect.Lists;
-import com.mongodb.MongoClient;
-import com.mongodb.MongoClientURI;
-import com.mongodb.client.MongoCollection;
+import java.text.SimpleDateFormat;
+import java.util.Calendar;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 
 @Ignore("Integration tests that cause failures in some environments. Require that they be run from Maven to run the embedded mongo maven plugin. Maven Plugin also fails in my CentOS 7 environment.")
 public class GetMongoTest {
@@ -47,11 +51,17 @@ public class GetMongoTest {
     private static final String DB_NAME = GetMongoTest.class.getSimpleName().toLowerCase();
     private static final String COLLECTION_NAME = "test";
 
-    private static final List<Document> DOCUMENTS = Lists.newArrayList(
-        new Document("_id", "doc_1").append("a", 1).append("b", 2).append("c", 3),
-        new Document("_id", "doc_2").append("a", 1).append("b", 2).append("c", 4),
-        new Document("_id", "doc_3").append("a", 1).append("b", 3)
+    private static final List<Document> DOCUMENTS;
+    private static final Calendar CAL;
+
+    static {
+        CAL = Calendar.getInstance();
+        DOCUMENTS = Lists.newArrayList(
+            new Document("_id", "doc_1").append("a", 1).append("b", 2).append("c", 3),
+            new Document("_id", "doc_2").append("a", 1).append("b", 2).append("c", 4).append("date_field", CAL.getTime()),
+            new Document("_id", "doc_3").append("a", 1).append("b", 3)
         );
+    }
 
     private TestRunner runner;
     private MongoClient mongoClient;
@@ -59,9 +69,12 @@ public class GetMongoTest {
     @Before
     public void setup() {
         runner = TestRunners.newTestRunner(GetMongo.class);
-        runner.setProperty(AbstractMongoProcessor.URI, MONGO_URI);
-        runner.setProperty(AbstractMongoProcessor.DATABASE_NAME, DB_NAME);
-        runner.setProperty(AbstractMongoProcessor.COLLECTION_NAME, COLLECTION_NAME);
+        runner.setVariable("uri", MONGO_URI);
+        runner.setVariable("db", DB_NAME);
+        runner.setVariable("collection", COLLECTION_NAME);
+        runner.setProperty(AbstractMongoProcessor.URI, "${uri}");
+        runner.setProperty(AbstractMongoProcessor.DATABASE_NAME, "${db}");
+        runner.setProperty(AbstractMongoProcessor.COLLECTION_NAME, "${collection}");
 
         mongoClient = new MongoClient(new MongoClientURI(MONGO_URI));
 
@@ -78,6 +91,7 @@ public class GetMongoTest {
 
     @Test
     public void testValidators() {
+
         TestRunner runner = TestRunners.newTestRunner(GetMongo.class);
         Collection<ValidationResult> results;
         ProcessContext pc;
@@ -116,11 +130,12 @@ public class GetMongoTest {
             results = ((MockProcessContext) pc).validate();
         }
         Assert.assertEquals(1, results.size());
-        Assert.assertTrue(results.iterator().next().toString().matches("'Query' .* is invalid because org.bson.json.JsonParseException"));
+        Assert.assertTrue(results.iterator().next().toString().contains("is invalid because"));
 
         // invalid projection
+        runner.setVariable("projection", "{a: x,y,z}");
         runner.setProperty(GetMongo.QUERY, "{a: 1}");
-        runner.setProperty(GetMongo.PROJECTION, "{a: x,y,z}");
+        runner.setProperty(GetMongo.PROJECTION, "${projection}");
         runner.enqueue(new byte[0]);
         pc = runner.getProcessContext();
         results = new HashSet<>();
@@ -144,8 +159,27 @@ public class GetMongoTest {
     }
 
     @Test
+    public void testCleanJson() throws Exception {
+        runner.setVariable("query", "{\"_id\": \"doc_2\"}");
+        runner.setProperty(GetMongo.QUERY, "${query}");
+        runner.setProperty(GetMongo.JSON_TYPE, GetMongo.JSON_STANDARD);
+        runner.run();
+
+        runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 1);
+        List<MockFlowFile> flowFiles = runner.getFlowFilesForRelationship(GetMongo.REL_SUCCESS);
+        byte[] raw = runner.getContentAsByteArray(flowFiles.get(0));
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, Object> parsed = mapper.readValue(raw, Map.class);
+        SimpleDateFormat format = new SimpleDateFormat("yyyy-MM-dd");
+
+        Assert.assertTrue(parsed.get("date_field").getClass() == String.class);
+        Assert.assertTrue(((String)parsed.get("date_field")).startsWith(format.format(CAL.getTime())));
+    }
+
+    @Test
     public void testReadOneDocument() throws Exception {
-        runner.setProperty(GetMongo.QUERY, "{a: 1, b: 3}");
+        runner.setVariable("query", "{a: 1, b: 3}");
+        runner.setProperty(GetMongo.QUERY, "${query}");
         runner.run();
 
         runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 1);
@@ -179,8 +213,9 @@ public class GetMongoTest {
 
     @Test
     public void testSort() throws Exception {
+        runner.setVariable("sort", "{a: -1, b: -1, c: 1}");
         runner.setProperty(GetMongo.QUERY, "{a: {$exists: true}}");
-        runner.setProperty(GetMongo.SORT, "{a: -1, b: -1, c: 1}");
+        runner.setProperty(GetMongo.SORT, "${sort}");
         runner.run();
 
         runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 3);
@@ -193,11 +228,35 @@ public class GetMongoTest {
     @Test
     public void testLimit() throws Exception {
         runner.setProperty(GetMongo.QUERY, "{a: {$exists: true}}");
-        runner.setProperty(GetMongo.LIMIT, "1");
+        runner.setProperty(GetMongo.LIMIT, "${limit}");
+        runner.setVariable("limit", "1");
         runner.run();
 
         runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 1);
         List<MockFlowFile> flowFiles = runner.getFlowFilesForRelationship(GetMongo.REL_SUCCESS);
         flowFiles.get(0).assertContentEquals(DOCUMENTS.get(0).toJson());
+    }
+
+    @Test
+    public void testResultsPerFlowfile() throws Exception {
+        runner.setProperty(GetMongo.RESULTS_PER_FLOWFILE, "${results.per.flowfile}");
+        runner.setVariable("results.per.flowfile", "2");
+        runner.run();
+        runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 2);
+        List<MockFlowFile> results = runner.getFlowFilesForRelationship(GetMongo.REL_SUCCESS);
+        Assert.assertTrue("Flowfile was empty", results.get(0).getSize() > 0);
+        Assert.assertEquals("Wrong mime type", results.get(0).getAttribute(CoreAttributes.MIME_TYPE.key()), "application/json");
+    }
+
+    @Test
+    public void testBatchSize() throws Exception {
+        runner.setProperty(GetMongo.RESULTS_PER_FLOWFILE, "2");
+        runner.setProperty(GetMongo.BATCH_SIZE, "${batch.size}");
+        runner.setVariable("batch.size", "1");
+        runner.run();
+        runner.assertAllFlowFilesTransferred(GetMongo.REL_SUCCESS, 2);
+        List<MockFlowFile> results = runner.getFlowFilesForRelationship(GetMongo.REL_SUCCESS);
+        Assert.assertTrue("Flowfile was empty", results.get(0).getSize() > 0);
+        Assert.assertEquals("Wrong mime type", results.get(0).getAttribute(CoreAttributes.MIME_TYPE.key()), "application/json");
     }
 }

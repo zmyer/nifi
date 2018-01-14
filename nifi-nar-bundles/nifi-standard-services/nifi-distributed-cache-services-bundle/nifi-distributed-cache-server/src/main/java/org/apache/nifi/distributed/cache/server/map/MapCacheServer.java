@@ -17,17 +17,21 @@
 package org.apache.nifi.distributed.cache.server.map;
 
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.ByteBuffer;
+import java.util.Map;
+import java.util.Set;
 
 import javax.net.ssl.SSLContext;
 
 import org.apache.nifi.distributed.cache.server.AbstractCacheServer;
 import org.apache.nifi.distributed.cache.server.EvictionPolicy;
-import org.apache.nifi.stream.io.DataOutputStream;
+import org.apache.nifi.remote.StandardVersionNegotiator;
+import org.apache.nifi.remote.VersionNegotiator;
 
 public class MapCacheServer extends AbstractCacheServer {
 
@@ -46,6 +50,14 @@ public class MapCacheServer extends AbstractCacheServer {
             persistentCache.restore();
             this.cache = persistentCache;
         }
+    }
+
+    /**
+     * Refer {@link org.apache.nifi.distributed.cache.protocol.ProtocolHandshake#initiateHandshake(InputStream, OutputStream, VersionNegotiator)}
+     * for details of each version enhancements.
+     */
+    protected StandardVersionNegotiator getVersionNegotiator() {
+        return new StandardVersionNegotiator(3, 2, 1);
     }
 
     @Override
@@ -88,7 +100,7 @@ public class MapCacheServer extends AbstractCacheServer {
                     dos.writeInt(0);
                 } else {
                     // we didn't put. Write back the previous value
-                    final byte[] byteArray = putResult.getExistingValue().array();
+                    final byte[] byteArray = putResult.getExisting().getValue().array();
                     dos.writeInt(byteArray.length);
                     dos.write(byteArray);
                 }
@@ -99,10 +111,10 @@ public class MapCacheServer extends AbstractCacheServer {
                 final byte[] key = readValue(dis);
                 final ByteBuffer existingValue = cache.get(ByteBuffer.wrap(key));
                 if (existingValue == null) {
-                    // there was no existing value; we did a "put".
+                    // there was no existing value.
                     dos.writeInt(0);
                 } else {
-                    // a value already existed. we did not update the map
+                    // a value already existed.
                     final byte[] byteArray = existingValue.array();
                     dos.writeInt(byteArray.length);
                     dos.write(byteArray);
@@ -110,10 +122,105 @@ public class MapCacheServer extends AbstractCacheServer {
 
                 break;
             }
+            case "subMap": {
+                final int numKeys = dis.readInt();
+                for(int i=0;i<numKeys;i++) {
+                    final byte[] key = readValue(dis);
+                    final ByteBuffer existingValue = cache.get(ByteBuffer.wrap(key));
+                    if (existingValue == null) {
+                        // there was no existing value.
+                        dos.writeInt(0);
+                    } else {
+                        // a value already existed.
+                        final byte[] byteArray = existingValue.array();
+                        dos.writeInt(byteArray.length);
+                        dos.write(byteArray);
+                    }
+                }
+                break;
+            }
             case "remove": {
                 final byte[] key = readValue(dis);
                 final boolean removed = cache.remove(ByteBuffer.wrap(key)) != null;
                 dos.writeBoolean(removed);
+                break;
+            }
+            case "removeAndGet": {
+                final byte[] key = readValue(dis);
+                final ByteBuffer removed = cache.remove(ByteBuffer.wrap(key));
+                if (removed == null) {
+                    // there was no value removed
+                    dos.writeInt(0);
+                } else {
+                    // reply with the value that was removed
+                    final byte[] byteArray = removed.array();
+                    dos.writeInt(byteArray.length);
+                    dos.write(byteArray);
+                }
+                break;
+            }
+            case "removeByPattern": {
+                final String pattern = dis.readUTF();
+                final Map<ByteBuffer, ByteBuffer> removed = cache.removeByPattern(pattern);
+                dos.writeLong(removed == null ? 0 : removed.size());
+                break;
+            }
+            case "removeByPatternAndGet": {
+                final String pattern = dis.readUTF();
+                final Map<ByteBuffer, ByteBuffer> removed = cache.removeByPattern(pattern);
+                if (removed == null || removed.size() == 0) {
+                    dos.writeLong(0);
+                } else {
+                    // write the map size
+                    dos.writeInt(removed.size());
+                    for (Map.Entry<ByteBuffer, ByteBuffer> entry : removed.entrySet()) {
+                        // write map entry key
+                        final byte[] key = entry.getKey().array();
+                        dos.writeInt(key.length);
+                        dos.write(key);
+                        // write map entry value
+                        final byte[] value = entry.getValue().array();
+                        dos.writeInt(value.length);
+                        dos.write(value);
+                    }
+                }
+                break;
+            }
+            case "fetch": {
+                final byte[] key = readValue(dis);
+                final MapCacheRecord existing = cache.fetch(ByteBuffer.wrap(key));
+                if (existing == null) {
+                    // there was no existing value.
+                    dos.writeLong(-1);
+                    dos.writeInt(0);
+                } else {
+                    // a value already existed.
+                    dos.writeLong(existing.getRevision());
+                    final byte[] byteArray = existing.getValue().array();
+                    dos.writeInt(byteArray.length);
+                    dos.write(byteArray);
+                }
+
+                break;
+            }
+            case "replace": {
+                final byte[] key = readValue(dis);
+                final long revision = dis.readLong();
+                final byte[] value = readValue(dis);
+                final MapPutResult result = cache.replace(new MapCacheRecord(ByteBuffer.wrap(key), ByteBuffer.wrap(value), revision));
+                dos.writeBoolean(result.isSuccessful());
+                break;
+            }
+            case "keySet": {
+                final Set<ByteBuffer> result = cache.keySet();
+                // write the set size
+                dos.writeInt(result.size());
+                // write each key in the set
+                for (ByteBuffer bb : result) {
+                    final byte[] byteArray = bb.array();
+                    dos.writeInt(byteArray.length);
+                    dos.write(byteArray);
+                }
                 break;
             }
             default: {

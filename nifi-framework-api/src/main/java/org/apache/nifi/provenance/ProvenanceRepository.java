@@ -27,6 +27,7 @@ import org.apache.nifi.provenance.search.SearchableField;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 
 public interface ProvenanceRepository extends ProvenanceEventRepository {
 
@@ -34,12 +35,13 @@ public interface ProvenanceRepository extends ProvenanceEventRepository {
      * Performs any initialization needed. This should be called only by the
      * framework.
      *
-     * @param eventReporter   to report to
-     * @param authorizer      the authorizer to use for authorizing individual events
+     * @param eventReporter to report to
+     * @param authorizer the authorizer to use for authorizing individual events
      * @param resourceFactory the resource factory to use for generating Provenance Resource objects for authorization purposes
+     * @param identifierLookup a mechanism for looking up identifiers in the flow
      * @throws java.io.IOException if unable to initialize
      */
-    void initialize(EventReporter eventReporter, Authorizer authorizer, ProvenanceAuthorizableFactory resourceFactory) throws IOException;
+    void initialize(EventReporter eventReporter, Authorizer authorizer, ProvenanceAuthorizableFactory resourceFactory, IdentifierLookup identifierLookup) throws IOException;
 
 
     ProvenanceEventRecord getEvent(long id, NiFiUser user) throws IOException;
@@ -180,4 +182,30 @@ public interface ProvenanceRepository extends ProvenanceEventRepository {
      * {@link ProvenanceRepository#submitQuery(Query, NiFiUser)} method
      */
     List<SearchableField> getSearchableAttributes();
+
+    /**
+     * @return the names of all Containers that exist for this Provenance
+     * Repository
+     */
+    Set<String> getContainerNames();
+
+    /**
+     * @param containerName name of container to check capacity on
+     * @return the maximum number of bytes that can be stored in the storage
+     * mechanism that backs the container with the given name
+     * @throws java.io.IOException if unable to check capacity
+     * @throws IllegalArgumentException if no container exists with the given
+     * name
+     */
+    long getContainerCapacity(String containerName) throws IOException;
+
+    /**
+     * @param containerName to check space on
+     * @return the number of bytes available to be used used by the storage
+     * mechanism that backs the container with the given name
+     * @throws java.io.IOException if unable to check space
+     * @throws IllegalArgumentException if no container exists with the given
+     * name
+     */
+    long getContainerUsableSpace(String containerName) throws IOException;
 }

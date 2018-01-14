@@ -25,9 +25,9 @@ import org.apache.nifi.controller.FlowController;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.repository.BatchingSessionFactory;
 import org.apache.nifi.controller.repository.ProcessContext;
-import org.apache.nifi.controller.repository.StandardFlowFileEvent;
 import org.apache.nifi.controller.repository.StandardProcessSession;
 import org.apache.nifi.controller.repository.StandardProcessSessionFactory;
+import org.apache.nifi.controller.repository.metrics.StandardFlowFileEvent;
 import org.apache.nifi.controller.scheduling.ProcessContextFactory;
 import org.apache.nifi.controller.scheduling.ScheduleState;
 import org.apache.nifi.controller.scheduling.SchedulingAgent;
@@ -75,11 +75,21 @@ public class ContinuallyRunProcessorTask implements Callable<Boolean> {
     }
 
     static boolean isYielded(final ProcessorNode procNode) {
-        return procNode.getYieldExpiration() >= System.currentTimeMillis();
+        // after one yield period, the scheduling agent could call this again when
+        // yieldExpiration == currentTime, and we don't want that to still be considered 'yielded'
+        // so this uses ">" instead of ">="
+        return procNode.getYieldExpiration() > System.currentTimeMillis();
     }
 
     static boolean isWorkToDo(final ProcessorNode procNode) {
         return procNode.isTriggerWhenEmpty() || !procNode.hasIncomingConnection() || !Connectables.hasNonLoopConnection(procNode) || Connectables.flowFilesQueued(procNode);
+    }
+
+    private boolean isBackPressureEngaged() {
+        return procNode.getIncomingConnections().stream()
+            .filter(con -> con.getSource() == procNode)
+            .map(con -> con.getFlowFileQueue())
+            .anyMatch(queue -> queue.isFull());
     }
 
     @Override
@@ -127,6 +137,7 @@ public class ContinuallyRunProcessorTask implements Callable<Boolean> {
         scheduleState.incrementActiveThreadCount();
 
         final long startNanos = System.nanoTime();
+        final long finishIfBackpressureEngaged = startNanos + (batchNanos / 25L);
         final long finishNanos = startNanos + batchNanos;
         int invocationCount = 0;
         try {
@@ -140,9 +151,15 @@ public class ContinuallyRunProcessorTask implements Callable<Boolean> {
                         return false;
                     }
 
-                    if (System.nanoTime() > finishNanos) {
+                    final long nanoTime = System.nanoTime();
+                    if (nanoTime > finishNanos) {
                         return false;
                     }
+
+                    if (nanoTime > finishIfBackpressureEngaged && isBackPressureEngaged()) {
+                        return false;
+                    }
+
 
                     if (!isWorkToDo(procNode)) {
                         break;

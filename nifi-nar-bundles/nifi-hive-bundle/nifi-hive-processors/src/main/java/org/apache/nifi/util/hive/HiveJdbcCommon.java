@@ -29,6 +29,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.nifi.components.PropertyDescriptor;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -40,6 +41,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import static java.sql.Types.ARRAY;
@@ -77,14 +79,31 @@ import static java.sql.Types.VARCHAR;
  */
 public class HiveJdbcCommon {
 
-    public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream) throws SQLException, IOException {
-        return convertToAvroStream(rs, outStream, null, null);
+    public static final String AVRO = "Avro";
+    public static final String CSV = "CSV";
+
+    public static final String MIME_TYPE_AVRO_BINARY = "application/avro-binary";
+    public static final String CSV_MIME_TYPE = "text/csv";
+
+
+    public static final PropertyDescriptor NORMALIZE_NAMES_FOR_AVRO = new PropertyDescriptor.Builder()
+            .name("hive-normalize-avro")
+            .displayName("Normalize Table/Column Names")
+            .description("Whether to change non-Avro-compatible characters in column names to Avro-compatible characters. For example, colons and periods "
+                    + "will be changed to underscores in order to build a valid Avro record.")
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .required(true)
+            .build();
+
+    public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, final int maxRows, boolean convertNames) throws SQLException, IOException {
+        return convertToAvroStream(rs, outStream, null, maxRows, convertNames, null);
     }
 
 
-    public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, String recordName, ResultSetRowCallback callback)
+    public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, String recordName, final int maxRows, boolean convertNames, ResultSetRowCallback callback)
             throws SQLException, IOException {
-        final Schema schema = createSchema(rs, recordName);
+        final Schema schema = createSchema(rs, recordName, convertNames);
         final GenericRecord rec = new GenericData.Record(schema);
 
         final DatumWriter<GenericRecord> datumWriter = new GenericDatumWriter<>(schema);
@@ -156,14 +175,17 @@ public class HiveJdbcCommon {
                 }
                 dataFileWriter.append(rec);
                 nrOfRows += 1;
+
+                if (maxRows > 0 && nrOfRows == maxRows)
+                    break;
             }
 
             return nrOfRows;
         }
     }
 
-    public static Schema createSchema(final ResultSet rs) throws SQLException {
-        return createSchema(rs, null);
+    public static Schema createSchema(final ResultSet rs, boolean convertNames) throws SQLException {
+        return createSchema(rs, null, false);
     }
 
     /**
@@ -172,10 +194,11 @@ public class HiveJdbcCommon {
      *
      * @param rs         The result set to convert to Avro
      * @param recordName The a priori record name to use if it cannot be determined from the result set.
+     * @param convertNames  Whether to convert column/table names to be legal Avro names
      * @return A Schema object representing the result set converted to an Avro record
      * @throws SQLException if any error occurs during conversion
      */
-    public static Schema createSchema(final ResultSet rs, String recordName) throws SQLException {
+    public static Schema createSchema(final ResultSet rs, String recordName, boolean convertNames) throws SQLException {
         final ResultSetMetaData meta = rs.getMetaData();
         final int nrOfColumns = meta.getColumnCount();
         String tableName = StringUtils.isEmpty(recordName) ? "NiFi_SelectHiveQL_Record" : recordName;
@@ -195,6 +218,9 @@ public class HiveJdbcCommon {
             // Not all drivers support getTableName, so just use the previously-set default
         }
 
+        if (convertNames) {
+            tableName = normalizeNameForAvro(tableName);
+        }
         final FieldAssembler<Schema> builder = SchemaBuilder.record(tableName).namespace("any.data").fields();
 
         /**
@@ -292,29 +318,39 @@ public class HiveJdbcCommon {
         return builder.endRecord();
     }
 
-    public static long convertToCsvStream(final ResultSet rs, final OutputStream outStream) throws SQLException, IOException {
-        return convertToCsvStream(rs, outStream, null, null);
+    public static long convertToCsvStream(final ResultSet rs, final OutputStream outStream, CsvOutputOptions outputOptions) throws SQLException, IOException {
+        return convertToCsvStream(rs, outStream, null, null, outputOptions);
     }
 
-    public static long convertToCsvStream(final ResultSet rs, final OutputStream outStream, String recordName, ResultSetRowCallback callback)
+    public static long convertToCsvStream(final ResultSet rs, final OutputStream outStream, String recordName, ResultSetRowCallback callback, CsvOutputOptions outputOptions)
             throws SQLException, IOException {
 
         final ResultSetMetaData meta = rs.getMetaData();
         final int nrOfColumns = meta.getColumnCount();
         List<String> columnNames = new ArrayList<>(nrOfColumns);
 
-        for (int i = 1; i <= nrOfColumns; i++) {
-            String columnNameFromMeta = meta.getColumnName(i);
-            // Hive returns table.column for column name. Grab the column name as the string after the last period
-            int columnNameDelimiter = columnNameFromMeta.lastIndexOf(".");
-            columnNames.add(columnNameFromMeta.substring(columnNameDelimiter + 1));
+        if (outputOptions.isHeader()) {
+            if (outputOptions.getAltHeader() == null) {
+                for (int i = 1; i <= nrOfColumns; i++) {
+                    String columnNameFromMeta = meta.getColumnName(i);
+                    // Hive returns table.column for column name. Grab the column name as the string after the last period
+                    int columnNameDelimiter = columnNameFromMeta.lastIndexOf(".");
+                    columnNames.add(columnNameFromMeta.substring(columnNameDelimiter + 1));
+                }
+            } else {
+                String[] altHeaderNames = outputOptions.getAltHeader().split(",");
+                columnNames = Arrays.asList(altHeaderNames);
+            }
         }
 
         // Write column names as header row
-        outStream.write(StringUtils.join(columnNames, ",").getBytes(StandardCharsets.UTF_8));
-        outStream.write("\n".getBytes(StandardCharsets.UTF_8));
+        outStream.write(StringUtils.join(columnNames, outputOptions.getDelimiter()).getBytes(StandardCharsets.UTF_8));
+        if (outputOptions.isHeader()) {
+            outStream.write("\n".getBytes(StandardCharsets.UTF_8));
+        }
 
         // Iterate over the rows
+        int maxRows = outputOptions.getMaxRowsPerFlowFile();
         long nrOfRows = 0;
         while (rs.next()) {
             if (callback != null) {
@@ -334,7 +370,24 @@ public class HiveJdbcCommon {
                     case VARCHAR:
                         String valueString = rs.getString(i);
                         if (valueString != null) {
-                            rowValues.add("\"" + StringEscapeUtils.escapeCsv(valueString) + "\"");
+                            // Removed extra quotes as those are a part of the escapeCsv when required.
+                            StringBuilder sb = new StringBuilder();
+                            if (outputOptions.isQuote()) {
+                                sb.append("\"");
+                                if (outputOptions.isEscape()) {
+                                    sb.append(StringEscapeUtils.escapeCsv(valueString));
+                                } else {
+                                    sb.append(valueString);
+                                }
+                                sb.append("\"");
+                                rowValues.add(sb.toString());
+                            } else {
+                                if (outputOptions.isEscape()) {
+                                    rowValues.add(StringEscapeUtils.escapeCsv(valueString));
+                                } else {
+                                    rowValues.add(valueString);
+                                }
+                            }
                         } else {
                             rowValues.add("");
                         }
@@ -358,11 +411,22 @@ public class HiveJdbcCommon {
                 }
             }
             // Write row values
-            outStream.write(StringUtils.join(rowValues, ",").getBytes(StandardCharsets.UTF_8));
+            outStream.write(StringUtils.join(rowValues, outputOptions.getDelimiter()).getBytes(StandardCharsets.UTF_8));
             outStream.write("\n".getBytes(StandardCharsets.UTF_8));
             nrOfRows++;
+
+            if (maxRows > 0 && nrOfRows == maxRows)
+                break;
         }
         return nrOfRows;
+    }
+
+    public static String normalizeNameForAvro(String inputName) {
+        String normalizedName = inputName.replaceAll("[^A-Za-z0-9_]", "_");
+        if (Character.isDigit(normalizedName.charAt(0))) {
+            normalizedName = "_" + normalizedName;
+        }
+        return normalizedName;
     }
 
     /**

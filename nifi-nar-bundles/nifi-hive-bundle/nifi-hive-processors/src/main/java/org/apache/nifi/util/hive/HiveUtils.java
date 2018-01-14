@@ -18,6 +18,7 @@
 
 package org.apache.nifi.util.hive;
 
+import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.security.UserGroupInformation;
 
 import org.apache.hive.hcatalog.streaming.ConnectionError;
@@ -39,10 +40,10 @@ public class HiveUtils {
         return new HiveEndPoint(options.getMetaStoreURI(), options.getDatabaseName(), options.getTableName(), partitionVals);
     }
 
-    public static HiveWriter makeHiveWriter(HiveEndPoint endPoint, ExecutorService callTimeoutPool, UserGroupInformation ugi, HiveOptions options)
+    public static HiveWriter makeHiveWriter(HiveEndPoint endPoint, ExecutorService callTimeoutPool, UserGroupInformation ugi, HiveOptions options, HiveConf hiveConf)
         throws HiveWriter.ConnectFailure, InterruptedException {
         return new HiveWriter(endPoint, options.getTxnsPerBatch(), options.getAutoCreatePartitions(),
-                              options.getCallTimeOut(), callTimeoutPool, ugi);
+                              options.getCallTimeOut(), callTimeoutPool, ugi, hiveConf);
     }
 
     public static void logAllHiveEndPoints(Map<HiveEndPoint, HiveWriter> allWriters) {
@@ -56,6 +57,9 @@ public class HiveUtils {
      */
     public static Validator createMultipleFilesExistValidator() {
         return (subject, input, context) -> {
+            if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+                return new ValidationResult.Builder().subject(subject).input(input).explanation("Expression Language Present").valid(true).build();
+            }
             final String[] files = input.split("\\s*,\\s*");
             for (String filename : files) {
                 try {

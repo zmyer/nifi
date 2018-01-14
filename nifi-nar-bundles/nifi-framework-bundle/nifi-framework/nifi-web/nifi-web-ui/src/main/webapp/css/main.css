@@ -153,6 +153,30 @@ div.context-menu-provenance {
     text-shadow: 0 0 4px rgba(255,255,255,1);
 }
 
+.up-to-date {
+    float: left;
+    color: #3da67a !important;
+    fill: #3da67a !important;
+    margin-top: 0px !important;
+    text-shadow: 0 0 4px rgba(255,255,255,1);
+}
+
+.locally-modified, .sync-failure {
+    float: left;
+    color: #747474 !important;
+    fill: #747474 !important;
+    margin-top: 0px !important;
+    text-shadow: 0 0 4px rgba(255,255,255,1);
+}
+
+.stale, .locally-modified-and-stale {
+    float: left;
+    color: #c7685d !important;
+    fill: #c7685d !important;
+    margin-top: 0px !important;
+    text-shadow: 0 0 4px rgba(255,255,255,1);
+}
+
 div.valid {
     float: left;
     background-color: transparent;
@@ -239,20 +263,11 @@ span.details-title {
     position: absolute;
     top: 0px;
     left: 135px;
-    cursor: pointer;
-    overflow: hidden;
+    height: 28px;
 }
 
 #template-file-field {
-    height: 28px;
-    display: inline;
-    position: absolute;
-    top: 0;
-    left: 0;
-    opacity: 0;
-    filter: alpha(opacity = 0);
-    z-index: 3000;
-    cursor: pointer;
+    display: none;
 }
 
 #submit-template-container {

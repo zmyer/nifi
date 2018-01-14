@@ -16,12 +16,42 @@
  */
 package org.apache.nifi.cluster.coordination.http.replication;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
+import org.apache.commons.collections4.map.MultiValueMap;
+import org.apache.nifi.authorization.user.NiFiUser;
+import org.apache.nifi.authorization.user.NiFiUserDetails;
+import org.apache.nifi.authorization.user.NiFiUserUtils;
+import org.apache.nifi.authorization.user.StandardNiFiUser;
+import org.apache.nifi.authorization.user.StandardNiFiUser.Builder;
+import org.apache.nifi.cluster.coordination.ClusterCoordinator;
+import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
+import org.apache.nifi.cluster.coordination.node.NodeConnectionStatus;
+import org.apache.nifi.cluster.manager.NodeResponse;
+import org.apache.nifi.cluster.manager.exception.ConnectingNodeMutableRequestException;
+import org.apache.nifi.cluster.manager.exception.DisconnectedNodeMutableRequestException;
+import org.apache.nifi.cluster.manager.exception.IllegalClusterStateException;
+import org.apache.nifi.cluster.protocol.NodeIdentifier;
+import org.apache.nifi.util.NiFiProperties;
+import org.apache.nifi.web.api.entity.Entity;
+import org.apache.nifi.web.api.entity.ProcessorEntity;
+import org.apache.nifi.web.security.ProxiedEntitiesUtils;
+import org.apache.nifi.web.security.token.NiFiAuthenticationToken;
+import org.glassfish.jersey.client.ClientRequest;
+import org.junit.Assert;
+import org.junit.BeforeClass;
+import org.junit.Test;
+import org.mockito.Mockito;
+import org.mockito.internal.util.reflection.Whitebox;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
+import org.springframework.security.core.Authentication;
+import org.springframework.security.core.context.SecurityContextHolder;
 
-import java.io.ByteArrayInputStream;
+import javax.ws.rs.HttpMethod;
+import javax.ws.rs.ProcessingException;
+import javax.ws.rs.client.ClientBuilder;
+import javax.ws.rs.client.Invocation;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.Status;
 import java.net.SocketTimeoutException;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -36,41 +66,48 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import javax.ws.rs.HttpMethod;
-
-import org.apache.commons.collections4.map.MultiValueMap;
-import org.apache.nifi.cluster.coordination.ClusterCoordinator;
-import org.apache.nifi.cluster.coordination.node.NodeConnectionState;
-import org.apache.nifi.cluster.coordination.node.NodeConnectionStatus;
-import org.apache.nifi.cluster.manager.NodeResponse;
-import org.apache.nifi.cluster.manager.exception.ConnectingNodeMutableRequestException;
-import org.apache.nifi.cluster.manager.exception.DisconnectedNodeMutableRequestException;
-import org.apache.nifi.cluster.manager.exception.IllegalClusterStateException;
-import org.apache.nifi.cluster.protocol.NodeIdentifier;
-import org.apache.nifi.util.NiFiProperties;
-import org.apache.nifi.web.api.entity.Entity;
-import org.apache.nifi.web.api.entity.ProcessorEntity;
-import org.junit.Assert;
-import org.junit.BeforeClass;
-import org.junit.Test;
-import org.mockito.Mockito;
-import org.mockito.internal.util.reflection.Whitebox;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
-
-import com.sun.jersey.api.client.Client;
-import com.sun.jersey.api.client.ClientHandlerException;
-import com.sun.jersey.api.client.ClientResponse;
-import com.sun.jersey.api.client.ClientResponse.Status;
-import com.sun.jersey.api.client.WebResource;
-import com.sun.jersey.core.header.InBoundHeaders;
-import com.sun.jersey.core.header.OutBoundHeaders;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class TestThreadPoolRequestReplicator {
 
     @BeforeClass
     public static void setupClass() {
         System.setProperty(NiFiProperties.PROPERTIES_FILE_PATH, "src/test/resources/conf/nifi.properties");
+    }
+
+    @Test
+    public void testFailedRequestsAreCleanedUp() {
+        withReplicator(replicator -> {
+            final Set<NodeIdentifier> nodeIds = new HashSet<>();
+            nodeIds.add(new NodeIdentifier("1", "localhost", 8000, "localhost", 8001, "localhost", 8002, 8003, false));
+            final URI uri = new URI("http://localhost:8080/processors/1");
+            final Entity entity = new ProcessorEntity();
+
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
+            final AsyncClusterResponse response = replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, true);
+
+            // We should get back the same response object
+            assertTrue(response == replicator.getClusterResponse(response.getRequestIdentifier()));
+
+            assertEquals(HttpMethod.GET, response.getMethod());
+            assertEquals(nodeIds, response.getNodesInvolved());
+
+            assertTrue(response == replicator.getClusterResponse(response.getRequestIdentifier()));
+
+            final NodeResponse nodeResponse = response.awaitMergedResponse(3, TimeUnit.SECONDS);
+            assertEquals(8000, nodeResponse.getNodeId().getApiPort());
+            assertEquals(Response.Status.FORBIDDEN.getStatusCode(), nodeResponse.getStatus());
+
+            assertNull(replicator.getClusterResponse(response.getRequestIdentifier()));
+        }, Status.FORBIDDEN, 0L, null);
     }
 
     /**
@@ -87,6 +124,10 @@ public class TestThreadPoolRequestReplicator {
             final URI uri = new URI("http://localhost:8080/processors/1");
             final Entity entity = new ProcessorEntity();
 
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
             final AsyncClusterResponse response = replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, true);
 
             // We should get back the same response object
@@ -99,10 +140,33 @@ public class TestThreadPoolRequestReplicator {
 
             final NodeResponse nodeResponse = response.awaitMergedResponse(3, TimeUnit.SECONDS);
             assertEquals(8000, nodeResponse.getNodeId().getApiPort());
-            assertEquals(ClientResponse.Status.OK.getStatusCode(), nodeResponse.getStatus());
+            assertEquals(Response.Status.OK.getStatusCode(), nodeResponse.getStatus());
 
             assertNull(replicator.getClusterResponse(response.getRequestIdentifier()));
         });
+    }
+
+    @Test
+    public void testRequestChain() {
+        final String proxyIdentity2 = "proxy-2";
+        final String proxyIdentity1 = "proxy-1";
+        final String userIdentity = "user";
+
+        withReplicator(replicator -> {
+            final Set<NodeIdentifier> nodeIds = new HashSet<>();
+            nodeIds.add(new NodeIdentifier("1", "localhost", 8000, "localhost", 8001, "localhost", 8002, 8003, false));
+            final URI uri = new URI("http://localhost:8080/processors/1");
+            final Entity entity = new ProcessorEntity();
+
+            // set the user
+            final NiFiUser proxy2 = new Builder().identity(proxyIdentity2).build();
+            final NiFiUser proxy1 = new Builder().identity(proxyIdentity1).chain(proxy2).build();
+            final NiFiUser user = new Builder().identity(userIdentity).chain(proxy1).build();
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(user));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
+            replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, true);
+        }, Response.Status.OK, 0L, null, "<" + userIdentity + "><" + proxyIdentity1 + "><" + proxyIdentity2 +">");
     }
 
     @Test(timeout = 15000)
@@ -113,6 +177,10 @@ public class TestThreadPoolRequestReplicator {
             nodeIds.add(nodeId);
             final URI uri = new URI("http://localhost:8080/processors/1");
             final Entity entity = new ProcessorEntity();
+
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
 
             final AsyncClusterResponse response = replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, true);
 
@@ -127,7 +195,7 @@ public class TestThreadPoolRequestReplicator {
             assertTrue(response.isComplete());
             assertNotNull(response.getMergedResponse());
             assertNull(replicator.getClusterResponse(response.getRequestIdentifier()));
-        }, Status.OK, 1000, new ClientHandlerException(new SocketTimeoutException()));
+        }, Status.OK, 1000, new ProcessingException(new SocketTimeoutException()));
     }
 
     @Test(timeout = 15000)
@@ -146,6 +214,10 @@ public class TestThreadPoolRequestReplicator {
             final URI uri = new URI("http://localhost:8080/processors/1");
             final Entity entity = new ProcessorEntity();
 
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
             final AsyncClusterResponse response = replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, true);
             assertNotNull(response.awaitMergedResponse(1, TimeUnit.SECONDS));
         }, null, 0L, new IllegalArgumentException("Exception created for unit test"));
@@ -157,18 +229,18 @@ public class TestThreadPoolRequestReplicator {
         final NodeIdentifier nodeId = new NodeIdentifier("1", "localhost", 8100, "localhost", 8101, "localhost", 8102, 8103, false);
         nodeIds.add(nodeId);
 
-        final ClusterCoordinator coordinator = Mockito.mock(ClusterCoordinator.class);
-        Mockito.when(coordinator.getConnectionStatus(Mockito.any(NodeIdentifier.class))).thenReturn(new NodeConnectionStatus(nodeId, NodeConnectionState.CONNECTED));
+        final ClusterCoordinator coordinator = mock(ClusterCoordinator.class);
+        when(coordinator.getConnectionStatus(Mockito.any(NodeIdentifier.class))).thenReturn(new NodeConnectionStatus(nodeId, NodeConnectionState.CONNECTED));
 
         final AtomicInteger requestCount = new AtomicInteger(0);
-        final ThreadPoolRequestReplicator replicator
-                = new ThreadPoolRequestReplicator(2, new Client(), coordinator, "1 sec", "1 sec", null, null, NiFiProperties.createBasicNiFiProperties(null, null)) {
+        final NiFiProperties props = NiFiProperties.createBasicNiFiProperties(null, null);
+        final ThreadPoolRequestReplicator replicator = new ThreadPoolRequestReplicator(2, 5, 100, ClientBuilder.newClient(), coordinator, "1 sec", "1 sec", null, null, props) {
             @Override
-            protected NodeResponse replicateRequest(final WebResource.Builder resourceBuilder, final NodeIdentifier nodeId, final String method,
-                                                    final URI uri, final String requestId, Map<String, String> givenHeaders) {
+            protected NodeResponse replicateRequest(final Invocation invocation, final NodeIdentifier nodeId, final String method,
+                                                    final URI uri, final String requestId, Map<String, String> givenHeaders, final StandardAsyncClusterResponse response) {
                 // the resource builder will not expose its headers to us, so we are using Mockito's Whitebox class to extract them.
-                final OutBoundHeaders headers = (OutBoundHeaders) Whitebox.getInternalState(resourceBuilder, "metadata");
-                final Object expectsHeader = headers.getFirst(ThreadPoolRequestReplicator.REQUEST_VALIDATION_HTTP_HEADER);
+                final ClientRequest requestContext = (ClientRequest) Whitebox.getInternalState(invocation, "requestContext");
+                final Object expectsHeader = requestContext.getHeaders().getFirst(ThreadPoolRequestReplicator.REQUEST_VALIDATION_HTTP_HEADER);
 
                 final int statusCode;
                 if (requestCount.incrementAndGet() == 1) {
@@ -180,12 +252,17 @@ public class TestThreadPoolRequestReplicator {
                 }
 
                 // Return given response from all nodes.
-                final ClientResponse clientResponse = new ClientResponse(statusCode, new InBoundHeaders(), new ByteArrayInputStream(new byte[0]), null);
+                final Response clientResponse = mock(Response.class);
+                when(clientResponse.getStatus()).thenReturn(statusCode);
                 return new NodeResponse(nodeId, method, uri, clientResponse, -1L, requestId);
             }
         };
 
         try {
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
             final AsyncClusterResponse clusterResponse = replicator.replicate(nodeIds, HttpMethod.POST,
                     new URI("http://localhost:80/processors/1"), new ProcessorEntity(), new HashMap<>(), true, true);
             clusterResponse.awaitMergedResponse();
@@ -202,8 +279,8 @@ public class TestThreadPoolRequestReplicator {
     }
 
     private ClusterCoordinator createClusterCoordinator() {
-        final ClusterCoordinator coordinator = Mockito.mock(ClusterCoordinator.class);
-        Mockito.when(coordinator.getConnectionStatus(Mockito.any(NodeIdentifier.class))).thenAnswer(new Answer<NodeConnectionStatus>() {
+        final ClusterCoordinator coordinator = mock(ClusterCoordinator.class);
+        when(coordinator.getConnectionStatus(Mockito.any(NodeIdentifier.class))).thenAnswer(new Answer<NodeConnectionStatus>() {
             @Override
             public NodeConnectionStatus answer(InvocationOnMock invocation) throws Throwable {
                 return new NodeConnectionStatus(invocation.getArgumentAt(0, NodeIdentifier.class), NodeConnectionState.CONNECTED);
@@ -228,9 +305,9 @@ public class TestThreadPoolRequestReplicator {
         otherState.add(new NodeIdentifier("3", "localhost", 8300, "localhost", 8301, "localhost", 8302, 8303, false));
         nodeMap.put(NodeConnectionState.CONNECTING, otherState);
 
-        Mockito.when(coordinator.getConnectionStates()).thenReturn(nodeMap);
-        final ThreadPoolRequestReplicator replicator
-                = new ThreadPoolRequestReplicator(2, new Client(), coordinator, "1 sec", "1 sec", null, null, NiFiProperties.createBasicNiFiProperties(null, null)) {
+        when(coordinator.getConnectionStates()).thenReturn(nodeMap);
+        final NiFiProperties props = NiFiProperties.createBasicNiFiProperties(null, null);
+        final ThreadPoolRequestReplicator replicator = new ThreadPoolRequestReplicator(2, 5, 100, ClientBuilder.newClient(), coordinator, "1 sec", "1 sec", null, null, props) {
             @Override
             public AsyncClusterResponse replicate(Set<NodeIdentifier> nodeIds, String method, URI uri, Object entity, Map<String, String> headers,
                                                   boolean indicateReplicated, boolean verify) {
@@ -239,6 +316,10 @@ public class TestThreadPoolRequestReplicator {
         };
 
         try {
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
             try {
                 replicator.replicate(HttpMethod.POST, new URI("http://localhost:80/processors/1"), new ProcessorEntity(), new HashMap<>());
                 Assert.fail("Expected ConnectingNodeMutableRequestException");
@@ -283,20 +364,21 @@ public class TestThreadPoolRequestReplicator {
 
         final ClusterCoordinator coordinator = createClusterCoordinator();
         final AtomicInteger requestCount = new AtomicInteger(0);
-        final ThreadPoolRequestReplicator replicator
-                = new ThreadPoolRequestReplicator(2, new Client(), coordinator, "1 sec", "1 sec", null, null, NiFiProperties.createBasicNiFiProperties(null, null)) {
+        final NiFiProperties props = NiFiProperties.createBasicNiFiProperties(null, null);
+        final ThreadPoolRequestReplicator replicator = new ThreadPoolRequestReplicator(2, 5, 100, ClientBuilder.newClient(), coordinator, "1 sec", "1 sec", null, null, props) {
             @Override
-            protected NodeResponse replicateRequest(final WebResource.Builder resourceBuilder, final NodeIdentifier nodeId, final String method,
-                                                    final URI uri, final String requestId, Map<String, String> givenHeaders) {
+            protected NodeResponse replicateRequest(final Invocation invocation, final NodeIdentifier nodeId, final String method,
+                    final URI uri, final String requestId, Map<String, String> givenHeaders, final StandardAsyncClusterResponse response) {
                 // the resource builder will not expose its headers to us, so we are using Mockito's Whitebox class to extract them.
-                final OutBoundHeaders headers = (OutBoundHeaders) Whitebox.getInternalState(resourceBuilder, "metadata");
-                final Object expectsHeader = headers.getFirst(ThreadPoolRequestReplicator.REQUEST_VALIDATION_HTTP_HEADER);
+                final ClientRequest requestContext = (ClientRequest) Whitebox.getInternalState(invocation, "requestContext");
+                final Object expectsHeader = requestContext.getHeaders().getFirst(ThreadPoolRequestReplicator.REQUEST_VALIDATION_HTTP_HEADER);
 
                 final int requestIndex = requestCount.incrementAndGet();
                 assertEquals(ThreadPoolRequestReplicator.NODE_CONTINUE, expectsHeader);
 
                 if (requestIndex == 1) {
-                    final ClientResponse clientResponse = new ClientResponse(150, new InBoundHeaders(), new ByteArrayInputStream(new byte[0]), null);
+                    final Response clientResponse = mock(Response.class);
+                    when(clientResponse.getStatus()).thenReturn(150);
                     return new NodeResponse(nodeId, method, uri, clientResponse, -1L, requestId);
                 } else {
                     final IllegalClusterStateException explanation = new IllegalClusterStateException("Intentional Exception for Unit Testing");
@@ -306,6 +388,10 @@ public class TestThreadPoolRequestReplicator {
         };
 
         try {
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
             final AsyncClusterResponse clusterResponse = replicator.replicate(nodeIds, HttpMethod.POST,
                     new URI("http://localhost:80/processors/1"), new ProcessorEntity(), new HashMap<>(), true, true);
             clusterResponse.awaitMergedResponse();
@@ -352,9 +438,17 @@ public class TestThreadPoolRequestReplicator {
             preNotifyLatch.await();
 
             try {
+                // set the user
+                final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+
+                // ensure the proxied entities header is set
+                final Map<String, String> updatedHeaders = new HashMap<>();
+                replicator.updateRequestHeaders(updatedHeaders, NiFiUserUtils.getNiFiUser());
+
                 // Pass in Collections.emptySet() for the node ID's so that an Exception is thrown
                 replicator.replicate(Collections.emptySet(), "GET", new URI("localhost:8080/nifi"), Collections.emptyMap(),
-                    Collections.emptyMap(), true, null, true, true, monitor);
+                    updatedHeaders, true, null, true, true, monitor);
                 Assert.fail("replicate did not throw IllegalArgumentException");
             } catch (final IllegalArgumentException iae) {
                 // expected
@@ -402,7 +496,15 @@ public class TestThreadPoolRequestReplicator {
             final URI uri = new URI("http://localhost:8080/processors/1");
             final Entity entity = new ProcessorEntity();
 
-            replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, null, true, true, monitor);
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
+            // ensure the proxied entities header is set
+            final Map<String, String> updatedHeaders = new HashMap<>();
+            replicator.updateRequestHeaders(updatedHeaders, NiFiUserUtils.getNiFiUser());
+
+            replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, updatedHeaders, true, null, true, true, monitor);
 
             // wait for monitor to be notified.
             postNotifyLatch.await();
@@ -447,7 +549,15 @@ public class TestThreadPoolRequestReplicator {
             final URI uri = new URI("http://localhost:8080/processors/1");
             final Entity entity = new ProcessorEntity();
 
-            replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, new HashMap<>(), true, null, true, true, monitor);
+            // set the user
+            final Authentication authentication = new NiFiAuthenticationToken(new NiFiUserDetails(StandardNiFiUser.ANONYMOUS));
+            SecurityContextHolder.getContext().setAuthentication(authentication);
+
+            // ensure the proxied entities header is set
+            final Map<String, String> updatedHeaders = new HashMap<>();
+            replicator.updateRequestHeaders(updatedHeaders, NiFiUserUtils.getNiFiUser());
+
+            replicator.replicate(nodeIds, HttpMethod.GET, uri, entity, updatedHeaders, true, null, true, true, monitor);
 
             // wait for monitor to be notified.
             postNotifyLatch.await();
@@ -456,16 +566,20 @@ public class TestThreadPoolRequestReplicator {
 
 
     private void withReplicator(final WithReplicator function) {
-        withReplicator(function, ClientResponse.Status.OK, 0L, null);
+        withReplicator(function, Response.Status.OK, 0L, null);
     }
 
     private void withReplicator(final WithReplicator function, final Status status, final long delayMillis, final RuntimeException failure) {
+        withReplicator(function, status, delayMillis, failure, "<>");
+    }
+
+    private void withReplicator(final WithReplicator function, final Status status, final long delayMillis, final RuntimeException failure, final String expectedRequestChain) {
         final ClusterCoordinator coordinator = createClusterCoordinator();
         final NiFiProperties nifiProps = NiFiProperties.createBasicNiFiProperties(null, null);
-        final ThreadPoolRequestReplicator replicator = new ThreadPoolRequestReplicator(2, new Client(), coordinator, "1 sec", "1 sec", null, null, nifiProps) {
+        final ThreadPoolRequestReplicator replicator = new ThreadPoolRequestReplicator(2, 5, 100, ClientBuilder.newClient(), coordinator, "1 sec", "1 sec", null, null, nifiProps) {
             @Override
-            protected NodeResponse replicateRequest(final WebResource.Builder resourceBuilder, final NodeIdentifier nodeId, final String method,
-                                                    final URI uri, final String requestId, Map<String, String> givenHeaders) {
+            protected NodeResponse replicateRequest(final Invocation invocation, final NodeIdentifier nodeId, final String method,
+                final URI uri, final String requestId, Map<String, String> givenHeaders, final StandardAsyncClusterResponse response) {
                 if (delayMillis > 0L) {
                     try {
                         Thread.sleep(delayMillis);
@@ -478,8 +592,15 @@ public class TestThreadPoolRequestReplicator {
                     throw failure;
                 }
 
+                final ClientRequest requestContext = (ClientRequest) Whitebox.getInternalState(invocation, "requestContext");
+                final Object proxiedEntities = requestContext.getHeaders().getFirst(ProxiedEntitiesUtils.PROXY_ENTITIES_CHAIN);
+
+                // ensure the request chain is in the request
+                Assert.assertEquals(expectedRequestChain, proxiedEntities);
+
                 // Return given response from all nodes.
-                final ClientResponse clientResponse = new ClientResponse(status, new InBoundHeaders(), new ByteArrayInputStream(new byte[0]), null);
+                final Response clientResponse = mock(Response.class);
+                when(clientResponse.getStatus()).thenReturn(status.getStatusCode());
                 return new NodeResponse(nodeId, method, uri, clientResponse, -1L, requestId);
             }
         };

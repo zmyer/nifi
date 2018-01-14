@@ -50,6 +50,7 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.email.smtp.SmtpConsumer;
+import org.apache.nifi.ssl.RestrictedSSLContextService;
 import org.apache.nifi.ssl.SSLContextService;
 import org.springframework.util.StringUtils;
 import org.subethamail.smtp.MessageContext;
@@ -124,7 +125,7 @@ public class ListenSMTP extends AbstractSessionFactoryProcessor {
             .description("The Controller Service to use in order to obtain an SSL Context. If this property is set, "
                     + "messages will be received over a secure connection.")
             .required(false)
-            .identifiesControllerService(SSLContextService.class)
+            .identifiesControllerService(RestrictedSSLContextService.class)
             .build();
 
     static final PropertyDescriptor CLIENT_AUTH = new PropertyDescriptor.Builder()
@@ -177,6 +178,7 @@ public class ListenSMTP extends AbstractSessionFactoryProcessor {
             try {
                 final SMTPServer server = prepareServer(context, sessionFactory);
                 server.start();
+                getLogger().debug("Started SMTP Server on port " + server.getPort());
                 smtp = server;
             } catch (final Exception ex) {//have to catch exception due to awkward exception handling in subethasmtp
                 smtp = null;
@@ -190,7 +192,10 @@ public class ListenSMTP extends AbstractSessionFactoryProcessor {
     public void stop() {
         try {
             smtp.stop();
-        } finally {
+            getLogger().debug("Stopped SMTP server on port " + smtp.getPort());
+        }catch (Exception ex){
+            getLogger().error("Error stopping SMTP server: " + ex.getMessage());
+        }finally {
             smtp = null;
         }
     }

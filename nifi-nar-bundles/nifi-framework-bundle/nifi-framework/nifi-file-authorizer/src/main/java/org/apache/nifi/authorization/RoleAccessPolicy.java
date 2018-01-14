@@ -94,7 +94,6 @@ public final class RoleAccessPolicy {
         roleAccessPolicies.put(Role.ROLE_ADMIN, Collections.unmodifiableSet(adminPolicies));
 
         final Set<RoleAccessPolicy> proxyPolicies = new HashSet<>();
-        proxyPolicies.add(new RoleAccessPolicy(ResourceType.Proxy.getValue(), READ_ACTION));
         proxyPolicies.add(new RoleAccessPolicy(ResourceType.Proxy.getValue(), WRITE_ACTION));
         if (rootGroupId != null) {
             proxyPolicies.add(new RoleAccessPolicy(ResourceType.Data.getValue() + ResourceType.ProcessGroup.getValue() + "/" + rootGroupId, READ_ACTION));
@@ -105,7 +104,6 @@ public final class RoleAccessPolicy {
         final Set<RoleAccessPolicy> nifiPolicies = new HashSet<>();
         nifiPolicies.add(new RoleAccessPolicy(ResourceType.Controller.getValue(), READ_ACTION));
         nifiPolicies.add(new RoleAccessPolicy(ResourceType.SiteToSite.getValue(), READ_ACTION));
-        nifiPolicies.add(new RoleAccessPolicy(ResourceType.SiteToSite.getValue(), WRITE_ACTION));
         roleAccessPolicies.put(Role.ROLE_NIFI, Collections.unmodifiableSet(nifiPolicies));
 
         return roleAccessPolicies;

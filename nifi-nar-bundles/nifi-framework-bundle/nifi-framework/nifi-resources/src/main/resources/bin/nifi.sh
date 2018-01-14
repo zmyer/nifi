@@ -38,12 +38,12 @@ done
 
 # Compute the canonicalized name by finding the physical path
 # for the directory we're in and appending the target file.
-PHYS_DIR=`pwd -P`
+PHYS_DIR=$(pwd -P)
 
 SCRIPT_DIR=$PHYS_DIR
 PROGNAME=$(basename "$0")
 
-. "$SCRIPT_DIR"/nifi-env.sh
+. "${SCRIPT_DIR}/nifi-env.sh"
 
 
 
@@ -80,6 +80,11 @@ detectOS() {
     if ${aix}; then
          export LDR_CNTRL=MAXDATA=0xB0000000@DSA
          echo ${LDR_CNTRL}
+    fi
+    # In addition to those, go around the linux space and query the widely
+    # adopted /etc/os-release to detect linux variants
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
     fi
 }
 
@@ -174,6 +179,8 @@ install() {
         SVC_NAME=$2
     fi
 
+    # since systemd seems to honour /etc/init.d we don't still create native systemd services
+    # yet...
     initd_dir='/etc/init.d'
     SVC_FILE="${initd_dir}/${SVC_NAME}"
 
@@ -222,11 +229,22 @@ SERVICEDESCRIPTOR
     # Provide the user execute access on the file
     chmod u+x ${SVC_FILE}
 
-    rm -f "/etc/rc2.d/S65${SVC_NAME}"
-    ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc2.d/S65${SVC_NAME}" || { echo "Could not create link /etc/rc2.d/S65${SVC_NAME}"; exit 1; }
-    rm -f "/etc/rc2.d/K65${SVC_NAME}"
-    ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc2.d/K65${SVC_NAME}" || { echo "Could not create link /etc/rc2.d/K65${SVC_NAME}"; exit 1; }
-    echo "Service ${SVC_NAME} installed"
+
+    # If SLES or OpenSuse...
+    if [ "${ID}" = "opensuse" ] || [ "${ID}" = "sles" ]; then
+        rm -f "/etc/rc.d/rc2.d/S65${SVC_NAME}"
+        ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc.d/rc2.d/S65${SVC_NAME}" || { echo "Could not create link /etc/rc.d/rc2.d/S65${SVC_NAME}"; exit 1; }
+        rm -f "/etc/rc.d/rc2.d/K65${SVC_NAME}"
+        ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc.d/rc2.d/K65${SVC_NAME}" || { echo "Could not create link /etc/rc.d/rc2.d/K65${SVC_NAME}"; exit 1; }
+        echo "Service ${SVC_NAME} installed"
+    # Anything other fallback to the old approach
+    else
+        rm -f "/etc/rc2.d/S65${SVC_NAME}"
+        ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc2.d/S65${SVC_NAME}" || { echo "Could not create link /etc/rc2.d/S65${SVC_NAME}"; exit 1; }
+        rm -f "/etc/rc2.d/K65${SVC_NAME}"
+        ln -s "/etc/init.d/${SVC_NAME}" "/etc/rc2.d/K65${SVC_NAME}" || { echo "Could not create link /etc/rc2.d/K65${SVC_NAME}"; exit 1; }
+        echo "Service ${SVC_NAME} installed"
+    fi
 }
 
 run() {
@@ -234,15 +252,14 @@ run() {
     BOOTSTRAP_CONF="${BOOTSTRAP_CONF_DIR}/bootstrap.conf";
     BOOTSTRAP_LIBS="${NIFI_HOME}/lib/bootstrap/*"
 
-    run_as=$(grep '^\s*run.as' "${BOOTSTRAP_CONF}" | cut -d'=' -f2)
+    run_as_user=$(grep '^\s*run.as' "${BOOTSTRAP_CONF}" | cut -d'=' -f2)
     # If the run as user is the same as that starting the process, ignore this configuration
-    if [ "$run_as" = "$(whoami)" ]; then
-        unset run_as
+    if [ "${run_as_user}" = "$(whoami)" ]; then
+        unset run_as_user
     fi
 
-    sudo_cmd_prefix=""
     if $cygwin; then
-        if [ -n "${run_as}" ]; then
+        if [ -n "${run_as_user}" ]; then
             echo "The run.as option is not supported in a Cygwin environment. Exiting."
             exit 1
         fi;
@@ -259,11 +276,9 @@ run() {
             BOOTSTRAP_CLASSPATH="${TOOLS_JAR};${BOOTSTRAP_CLASSPATH}"
         fi
     else
-        if [ -n "${run_as}" ]; then
-            if id -u "${run_as}" >/dev/null 2>&1; then
-                sudo_cmd_prefix="sudo -u ${run_as}"
-            else
-                echo "The specified run.as user ${run_as} does not exist. Exiting."
+        if [ -n "${run_as_user}" ]; then
+            if ! id -u "${run_as_user}" >/dev/null 2>&1; then
+                echo "The specified run.as user ${run_as_user} does not exist. Exiting."
                 exit 1
             fi
         fi;
@@ -284,18 +299,28 @@ run() {
     # all other commands will terminate quickly so want to just wait for them
 
     #setup directory parameters
-    BOOTSTRAP_LOG_PARAMS="-Dorg.apache.nifi.bootstrap.config.log.dir="\""${NIFI_LOG_DIR}"\"""
-    BOOTSTRAP_PID_PARAMS="-Dorg.apache.nifi.bootstrap.config.pid.dir="\""${NIFI_PID_DIR}"\"""
-    BOOTSTRAP_CONF_PARAMS="-Dorg.apache.nifi.bootstrap.config.file="\""${BOOTSTRAP_CONF}"\"""
+    BOOTSTRAP_LOG_PARAMS="-Dorg.apache.nifi.bootstrap.config.log.dir='${NIFI_LOG_DIR}'"
+    BOOTSTRAP_PID_PARAMS="-Dorg.apache.nifi.bootstrap.config.pid.dir='${NIFI_PID_DIR}'"
+    BOOTSTRAP_CONF_PARAMS="-Dorg.apache.nifi.bootstrap.config.file='${BOOTSTRAP_CONF}'"
 
     BOOTSTRAP_DIR_PARAMS="${BOOTSTRAP_LOG_PARAMS} ${BOOTSTRAP_PID_PARAMS} ${BOOTSTRAP_CONF_PARAMS}"
 
-    RUN_NIFI_CMD="cd "\""${NIFI_HOME}"\"" && ${sudo_cmd_prefix} "\""${JAVA}"\"" -cp "\""${BOOTSTRAP_CLASSPATH}"\"" -Xms12m -Xmx24m ${BOOTSTRAP_DIR_PARAMS}  org.apache.nifi.bootstrap.RunNiFi"
+    run_nifi_cmd="'${JAVA}' -cp '${BOOTSTRAP_CLASSPATH}' -Xms12m -Xmx24m ${BOOTSTRAP_DIR_PARAMS} org.apache.nifi.bootstrap.RunNiFi $@"
+
+    if [ -n "${run_as_user}" ]; then
+      # Provide SCRIPT_DIR and execute nifi-env for the run.as user command
+      run_nifi_cmd="sudo -u ${run_as_user} sh -c \"SCRIPT_DIR='${SCRIPT_DIR}' && . '${SCRIPT_DIR}/nifi-env.sh' && ${run_nifi_cmd}\""
+    fi
+
+    if [ "$1" = "run" ]; then
+      # Use exec to handover PID to RunNiFi java process, instead of foking it as a child process
+      run_nifi_cmd="exec ${run_nifi_cmd}"
+    fi
 
     if [ "$1" = "start" ]; then
-        (eval $RUN_NIFI_CMD $@ &)
+        ( eval "cd ${NIFI_HOME} && ${run_nifi_cmd}" & )> /dev/null 1>&-
     else
-        (eval $RUN_NIFI_CMD $@)
+        eval "cd ${NIFI_HOME} && ${run_nifi_cmd}"
     fi
     EXIT_STATUS=$?
 

@@ -16,6 +16,7 @@
  */
 package org.apache.nifi.processors.script;
 
+import org.apache.nifi.script.ScriptingComponentUtils;
 import org.apache.nifi.util.MockFlowFile;
 import org.junit.Before;
 import org.junit.Test;
@@ -24,7 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
- * Created by mburgess on 1/25/16.
+ * Unit tests for ExecuteScript with Jython.
  */
 public class TestExecuteJython extends BaseScriptTest {
 
@@ -41,8 +42,8 @@ public class TestExecuteJython extends BaseScriptTest {
     @Test
     public void testReadFlowFileContentAndStoreInFlowFileAttributeWithScriptBody() throws Exception {
         runner.setValidateExpressionUsage(false);
-        runner.setProperty(ExecuteScript.SCRIPT_ENGINE, "python");
-        runner.setProperty(ExecuteScript.SCRIPT_BODY,
+        runner.setProperty(scriptingComponent.getScriptingComponentHelper().SCRIPT_ENGINE, "python");
+        runner.setProperty(ScriptingComponentUtils.SCRIPT_BODY,
                 "from org.apache.nifi.processors.script import ExecuteScript\n"
                         + "flowFile = session.get()\n"
                         + "flowFile = session.putAttribute(flowFile, \"from-content\", \"test content\")\n"
@@ -65,8 +66,8 @@ public class TestExecuteJython extends BaseScriptTest {
     @Test(expected = AssertionError.class)
     public void testScriptNoTransfer() throws Exception {
         runner.setValidateExpressionUsage(false);
-        runner.setProperty(ExecuteScript.SCRIPT_ENGINE, "python");
-        runner.setProperty(ExecuteScript.SCRIPT_BODY,
+        runner.setProperty(scriptingComponent.getScriptingComponentHelper().SCRIPT_ENGINE, "python");
+        runner.setProperty(ScriptingComponentUtils.SCRIPT_BODY,
                 "flowFile = session.putAttribute(flowFile, \"from-content\", \"test content\")\n");
 
         runner.assertValid();

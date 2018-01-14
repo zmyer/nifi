@@ -16,10 +16,16 @@
  */
 package org.apache.nifi.distributed.cache.client;
 
+import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +35,7 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnEnabled;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.controller.ConfigurationContext;
@@ -39,8 +46,6 @@ import org.apache.nifi.remote.StandardVersionNegotiator;
 import org.apache.nifi.remote.VersionNegotiator;
 import org.apache.nifi.ssl.SSLContextService;
 import org.apache.nifi.ssl.SSLContextService.ClientAuth;
-import org.apache.nifi.stream.io.ByteArrayOutputStream;
-import org.apache.nifi.stream.io.DataOutputStream;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,7 +53,7 @@ import org.slf4j.LoggerFactory;
 @SeeAlso(classNames = {"org.apache.nifi.distributed.cache.server.map.DistributedMapCacheServer", "org.apache.nifi.ssl.StandardSSLContextService"})
 @CapabilityDescription("Provides the ability to communicate with a DistributedMapCacheServer. This can be used in order to share a Map "
     + "between nodes in a NiFi cluster")
-public class DistributedMapCacheClientService extends AbstractControllerService implements DistributedMapCacheClient {
+public class DistributedMapCacheClientService extends AbstractControllerService implements AtomicDistributedMapCacheClient<Long> {
 
     private static final Logger logger = LoggerFactory.getLogger(DistributedMapCacheClientService.class);
 
@@ -98,6 +103,11 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
     @OnEnabled
     public void cacheConfig(final ConfigurationContext context) {
         this.configContext = context;
+    }
+
+    @OnStopped
+    public void onStopped() throws IOException {
+        close();
     }
 
     @Override
@@ -199,6 +209,36 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
     }
 
     @Override
+    public <K, V> Map<K, V> subMap(Set<K> keys, Serializer<K> keySerializer, Deserializer<V> valueDeserializer) throws IOException {
+        return withCommsSession(session -> {
+            Map<K, V> response = new HashMap<>(keys.size());
+            try {
+                validateProtocolVersion(session, 3);
+
+                final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+                dos.writeUTF("subMap");
+                serialize(keys, keySerializer, dos);
+                dos.flush();
+
+                // read response
+                final DataInputStream dis = new DataInputStream(session.getInputStream());
+
+                for (K key : keys) {
+                    final byte[] responseBuffer = readLengthDelimitedResponse(dis);
+                    response.put(key, valueDeserializer.deserialize(responseBuffer));
+                }
+            } catch (UnsupportedOperationException uoe) {
+                // If the server doesn't support subMap, just emulate it with multiple calls to get()
+                for (K key : keys) {
+                    response.put(key, get(key, keySerializer, valueDeserializer));
+                }
+            }
+
+            return response;
+        });
+    }
+
+    @Override
     public <K> boolean remove(final K key, final Serializer<K> serializer) throws IOException {
         return withCommsSession(new CommsAction<Boolean>() {
             @Override
@@ -216,6 +256,142 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
         });
     }
 
+    @Override
+    public <K, V> V removeAndGet(K key, Serializer<K> keySerializer, Deserializer<V> valueDeserializer) throws IOException {
+        return withCommsSession(new CommsAction<V>() {
+            @Override
+            public V execute(final CommsSession session) throws IOException {
+                validateProtocolVersion(session, 3);
+
+                final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+                dos.writeUTF("removeAndGet");
+
+                serialize(key, keySerializer, dos);
+                dos.flush();
+
+                // read response
+                final DataInputStream dis = new DataInputStream(session.getInputStream());
+                final byte[] responseBuffer = readLengthDelimitedResponse(dis);
+                return valueDeserializer.deserialize(responseBuffer);
+            }
+        });
+    }
+
+    @Override
+    public long removeByPattern(String regex) throws IOException {
+        return withCommsSession(session -> {
+            final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+            dos.writeUTF("removeByPattern");
+            dos.writeUTF(regex);
+            dos.flush();
+
+            // read response
+            final DataInputStream dis = new DataInputStream(session.getInputStream());
+            return dis.readLong();
+        });
+    }
+
+    @Override
+    public <K, V> Map<K, V> removeByPatternAndGet(String regex, Deserializer<K> keyDeserializer, Deserializer<V> valueDeserializer) throws IOException {
+        return withCommsSession(new CommsAction<Map<K, V>>() {
+            @Override
+            public Map<K, V> execute(CommsSession session) throws IOException {
+                validateProtocolVersion(session, 3);
+
+                final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+                dos.writeUTF("removeByPatternAndGet");
+                dos.writeUTF(regex);
+                dos.flush();
+
+                // read response
+                final DataInputStream dis = new DataInputStream(session.getInputStream());
+                final int mapSize = dis.readInt();
+                HashMap<K, V> resultMap = new HashMap<>(mapSize);
+                for (int i=0; i<mapSize; i++) {
+                    final byte[] keyBuffer = readLengthDelimitedResponse(dis);
+                    K key = keyDeserializer.deserialize(keyBuffer);
+                    final byte[] valueBuffer = readLengthDelimitedResponse(dis);
+                    V value = valueDeserializer.deserialize(valueBuffer);
+                    resultMap.put(key, value);
+                }
+                return resultMap;
+            }
+        });
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <K, V> AtomicCacheEntry<K, V, Long> fetch(K key, Serializer<K> keySerializer, Deserializer<V> valueDeserializer) throws IOException {
+        return withCommsSession(session -> {
+            validateProtocolVersion(session, 2);
+
+            final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+            dos.writeUTF("fetch");
+
+            serialize(key, keySerializer, dos);
+            dos.flush();
+
+            // read response
+            final DataInputStream dis = new DataInputStream(session.getInputStream());
+            final long revision = dis.readLong();
+            final byte[] responseBuffer = readLengthDelimitedResponse(dis);
+
+            if (revision < 0) {
+                // This indicates that key was not found.
+                return null;
+            }
+
+            return new AtomicCacheEntry(key, valueDeserializer.deserialize(responseBuffer), revision);
+        });
+    }
+
+    private void validateProtocolVersion(final CommsSession session, final int requiredProtocolVersion) {
+        if (session.getProtocolVersion() < requiredProtocolVersion) {
+            throw new UnsupportedOperationException("Remote cache server doesn't support protocol version " + requiredProtocolVersion);
+        }
+    }
+
+    @Override
+    public <K, V> boolean replace(AtomicCacheEntry<K, V, Long> entry, Serializer<K> keySerializer, Serializer<V> valueSerializer) throws IOException {
+        return withCommsSession(session -> {
+            validateProtocolVersion(session, 2);
+
+            final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+            dos.writeUTF("replace");
+
+            serialize(entry.getKey(), keySerializer, dos);
+            dos.writeLong(entry.getRevision().orElse(0L));
+            serialize(entry.getValue(), valueSerializer, dos);
+
+            dos.flush();
+
+            // read response
+            final DataInputStream dis = new DataInputStream(session.getInputStream());
+            return dis.readBoolean();
+        });
+    }
+
+    @Override
+    public <K> Set<K> keySet(Deserializer<K> keyDeserializer) throws IOException {
+        return withCommsSession(session -> {
+            validateProtocolVersion(session, 3);
+
+            final DataOutputStream dos = new DataOutputStream(session.getOutputStream());
+            dos.writeUTF("keySet");
+            dos.flush();
+
+            // read response
+            final DataInputStream dis = new DataInputStream(session.getInputStream());
+            final int setSize = dis.readInt();
+            HashSet<K> resultSet = new HashSet<>(setSize);
+            for (int i=0; i<setSize; i++) {
+                final byte[] responseBuffer = readLengthDelimitedResponse(dis);
+                resultSet.add(keyDeserializer.deserialize(responseBuffer));
+            }
+            return resultSet;
+        });
+    }
+
     private byte[] readLengthDelimitedResponse(final DataInputStream dis) throws IOException {
         final int responseLength = dis.readInt();
         final byte[] responseBuffer = new byte[responseLength];
@@ -226,14 +402,14 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
     public CommsSession createCommsSession(final ConfigurationContext context) throws IOException {
         final String hostname = context.getProperty(HOSTNAME).getValue();
         final int port = context.getProperty(PORT).asInteger();
-        final long timeoutMillis = context.getProperty(COMMUNICATIONS_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS);
+        final int timeoutMillis = context.getProperty(COMMUNICATIONS_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue();
         final SSLContextService sslContextService = context.getProperty(SSL_CONTEXT_SERVICE).asControllerService(SSLContextService.class);
 
         final CommsSession commsSession;
         if (sslContextService == null) {
-            commsSession = new StandardCommsSession(hostname, port);
+            commsSession = new StandardCommsSession(hostname, port, timeoutMillis);
         } else {
-            commsSession = new SSLCommsSession(sslContextService.createSSLContext(ClientAuth.REQUIRED), hostname, port);
+            commsSession = new SSLCommsSession(sslContextService.createSSLContext(ClientAuth.REQUIRED), hostname, port, timeoutMillis);
         }
 
         commsSession.setTimeout(timeoutMillis, TimeUnit.MILLISECONDS);
@@ -247,9 +423,10 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
         }
 
         session = createCommsSession(configContext);
-        final VersionNegotiator versionNegotiator = new StandardVersionNegotiator(1);
+        final VersionNegotiator versionNegotiator = new StandardVersionNegotiator(3, 2, 1);
         try {
             ProtocolHandshake.initiateHandshake(session.getInputStream(), session.getOutputStream(), versionNegotiator);
+            session.setProtocolVersion(versionNegotiator.getVersion());
         } catch (final HandshakeException e) {
             try {
                 session.close();
@@ -293,6 +470,17 @@ public class DistributedMapCacheClientService extends AbstractControllerService 
         serializer.serialize(value, baos);
         dos.writeInt(baos.size());
         baos.writeTo(dos);
+    }
+
+    private <T> void serialize(final Set<T> values, final Serializer<T> serializer, final DataOutputStream dos) throws IOException {
+        // Write the number of elements to follow, then each element and its size
+        dos.writeInt(values.size());
+        for(T value : values) {
+            final ByteArrayOutputStream baos = new ByteArrayOutputStream();
+            serializer.serialize(value, baos);
+            dos.writeInt(baos.size());
+            baos.writeTo(dos);
+        }
     }
 
     private <T> T withCommsSession(final CommsAction<T> action) throws IOException {

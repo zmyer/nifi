@@ -15,9 +15,45 @@
  * limitations under the License.
  */
 
-/* global nf, d3 */
+/* global d3, define, module, require, exports */
 
-nf.ProcessGroup = (function () {
+(function (root, factory) {
+    if (typeof define === 'function' && define.amd) {
+        define(['jquery',
+                'd3',
+                'nf.Connection',
+                'nf.Common',
+                'nf.Client',
+                'nf.CanvasUtils',
+                'nf.Dialog'],
+            function ($, d3, nfConnection, nfCommon, nfClient, nfCanvasUtils, nfDialog) {
+                return (nf.ProcessGroup = factory($, d3, nfConnection, nfCommon, nfClient, nfCanvasUtils, nfDialog));
+            });
+    } else if (typeof exports === 'object' && typeof module === 'object') {
+        module.exports = (nf.ProcessGroup =
+            factory(require('jquery'),
+                require('d3'),
+                require('nf.Connection'),
+                require('nf.Common'),
+                require('nf.Client'),
+                require('nf.CanvasUtils'),
+                require('nf.Dialog')));
+    } else {
+        nf.ProcessGroup = factory(root.$,
+            root.d3,
+            root.nf.Connection,
+            root.nf.Common,
+            root.nf.Client,
+            root.nf.CanvasUtils,
+            root.nf.Dialog);
+    }
+}(this, function ($, d3, nfConnection, nfCommon, nfClient, nfCanvasUtils, nfDialog) {
+    'use strict';
+
+    var nfConnectable;
+    var nfDraggable;
+    var nfSelectable;
+    var nfContextMenu;
 
     var PREVIEW_NAME_LENGTH = 30;
 
@@ -50,16 +86,12 @@ nf.ProcessGroup = (function () {
     // --------------------------
 
     /**
-     * Gets the process group comments.
+     * Determines whether the specified process group is under version control.
      *
-     * @param {object} d
+     * @param d
      */
-    var getProcessGroupComments = function (d) {
-        if (nf.Common.isBlank(d.component.comments)) {
-            return 'No comments specified';
-        } else {
-            return d.component.comments;
-        }
+    var isUnderVersionControl = function (d) {
+        return nfCommon.isDefinedAndNotNull(d.versionedFlowState);
     };
 
     /**
@@ -90,7 +122,7 @@ nf.ProcessGroup = (function () {
                 'class': 'process-group component'
             })
             .classed('selected', selected)
-            .call(nf.CanvasUtils.position);
+            .call(nfCanvasUtils.position);
 
         // ----
         // body
@@ -144,17 +176,25 @@ nf.ProcessGroup = (function () {
                 'class': 'process-group-name'
             });
 
+        // process group name
+        processGroup.append('text')
+            .attr({
+                'x': 10,
+                'y': 21,
+                'class': 'version-control'
+            });
+
         // always support selecting and navigation
         processGroup.on('dblclick', function (d) {
-                // enter this group on double click
-                nf.CanvasUtils.enterGroup(d.id);
-            })
-            .call(nf.Selectable.activate).call(nf.ContextMenu.activate);
+            // enter this group on double click
+            nfProcessGroup.enterGroup(d.id);
+        })
+            .call(nfSelectable.activate).call(nfContextMenu.activate);
 
         // only support dragging, connection, and drag and drop if appropriate
         processGroup.filter(function (d) {
-                return d.permissions.canWrite && d.permissions.canRead;
-            })
+            return d.permissions.canWrite && d.permissions.canRead;
+        })
             .on('mouseover.drop', function (d) {
                 // Using mouseover/out to workaround chrome issue #122746
 
@@ -167,7 +207,7 @@ nf.ProcessGroup = (function () {
                     var drag = d3.select('rect.drag-selection');
                     if (!drag.empty()) {
                         // filter the current selection by this group
-                        var selection = nf.CanvasUtils.getSelection().filter(function (d) {
+                        var selection = nfCanvasUtils.getSelection().filter(function (d) {
                             return targetData.id === d.id;
                         });
 
@@ -176,7 +216,7 @@ nf.ProcessGroup = (function () {
                             // mark that we are hovering over a drop area if appropriate
                             target.classed('drop', function () {
                                 // get the current selection and ensure its disconnected
-                                return nf.CanvasUtils.isDisconnected(nf.CanvasUtils.getSelection());
+                                return nfConnection.isDisconnected(nfCanvasUtils.getSelection());
                             });
                         }
                     }
@@ -186,8 +226,8 @@ nf.ProcessGroup = (function () {
                 // mark that we are no longer hovering over a drop area unconditionally
                 d3.select(this).classed('drop', false);
             })
-            .call(nf.Draggable.activate)
-            .call(nf.Connectable.activate);
+            .call(nfDraggable.activate)
+            .call(nfConnectable.activate);
     };
 
     // attempt of space between component count and icon for process group contents
@@ -221,7 +261,7 @@ nf.ProcessGroup = (function () {
             var details = processGroup.select('g.process-group-details');
 
             // update the component behavior as appropriate
-            nf.CanvasUtils.editable(processGroup);
+            nfCanvasUtils.editable(processGroup, nfConnectable, nfDraggable);
 
             // if this processor is visible, render everything
             if (processGroup.classed('visible')) {
@@ -243,6 +283,19 @@ nf.ProcessGroup = (function () {
                             'fill': '#e3e8eb'
                         });
 
+                    details.append('rect')
+                        .attr({
+                            'x': 0,
+                            'y': function () {
+                                return processGroupData.dimensions.height - 24;
+                            },
+                            'width': function () {
+                                return processGroupData.dimensions.width;
+                            },
+                            'height': 24,
+                            'fill': '#e3e8eb'
+                        });
+
                     // --------
                     // contents
                     // --------
@@ -255,7 +308,10 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-transmitting process-group-contents-icon',
                             'font-family': 'FontAwesome'
                         })
-                        .text('\uf140');
+                        .text('\uf140')
+                        .append("title")
+                        .text("Transmitting Remote Process Groups");
+
 
                     // transmitting count
                     details.append('text')
@@ -271,7 +327,9 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-not-transmitting process-group-contents-icon',
                             'font-family': 'flowfont'
                         })
-                        .text('\ue80a');
+                        .text('\ue80a')
+                        .append("title")
+                        .text("Not Transmitting Remote Process Groups");
 
                     // not transmitting count
                     details.append('text')
@@ -287,7 +345,9 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-running process-group-contents-icon',
                             'font-family': 'FontAwesome'
                         })
-                        .text('\uf04b');
+                        .text('\uf04b')
+                        .append("title")
+                        .text("Running Components");
 
                     // running count
                     details.append('text')
@@ -303,7 +363,9 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-stopped process-group-contents-icon',
                             'font-family': 'FontAwesome'
                         })
-                        .text('\uf04d');
+                        .text('\uf04d')
+                        .append("title")
+                        .text("Stopped Components");
 
                     // stopped count
                     details.append('text')
@@ -319,7 +381,9 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-invalid process-group-contents-icon',
                             'font-family': 'FontAwesome'
                         })
-                        .text('\uf071');
+                        .text('\uf071')
+                        .append("title")
+                        .text("Invalid Components");
 
                     // invalid count
                     details.append('text')
@@ -335,13 +399,126 @@ nf.ProcessGroup = (function () {
                             'class': 'process-group-disabled process-group-contents-icon',
                             'font-family': 'flowfont'
                         })
-                        .text('\ue802');
+                        .text('\ue802')
+                        .append("title")
+                        .text("Disabled Components");
 
                     // disabled count
                     details.append('text')
                         .attr({
                             'y': 49,
                             'class': 'process-group-disabled-count process-group-contents-count'
+                        });
+
+                    // up to date icon
+                    details.append('text')
+                        .attr({
+                            'x': 10,
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-up-to-date process-group-contents-icon',
+                            'font-family': 'FontAwesome'
+                        })
+                        .text('\uf00c')
+                        .append("title")
+                        .text("Up to date Versioned Process Groups");
+
+                    // up to date count
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-up-to-date-count process-group-contents-count'
+                        });
+
+                    // locally modified icon
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-locally-modified process-group-contents-icon',
+                            'font-family': 'FontAwesome'
+                        })
+                        .text('\uf069')
+                        .append("title")
+                        .text("Locally modified Versioned Process Groups");
+
+                    // locally modified count
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-locally-modified-count process-group-contents-count'
+                        });
+
+                    // stale icon
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-stale process-group-contents-icon',
+                            'font-family': 'FontAwesome'
+                        })
+                        .text('\uf0aa')
+                        .append("title")
+                        .text("Stale Versioned Process Groups");
+
+                    // stale count
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-stale-count process-group-contents-count'
+                        });
+
+                    // locally modified and stale icon
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-locally-modified-and-stale process-group-contents-icon',
+                            'font-family': 'FontAwesome'
+                        })
+                        .text('\uf06a')
+                        .append("title")
+                        .text("Locally modified and stale Versioned Process Groups");
+
+                    // locally modified and stale count
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-locally-modified-and-stale-count process-group-contents-count'
+                        });
+
+                    // sync failure icon
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-sync-failure process-group-contents-icon',
+                            'font-family': 'FontAwesome'
+                        })
+                        .text('\uf128')
+                        .append("title")
+                        .text("Sync failure Versioned Process Groups");
+
+                    // sync failure count
+                    details.append('text')
+                        .attr({
+                            'y': function () {
+                                return processGroupData.dimensions.height - 7;
+                            },
+                            'class': 'process-group-sync-failure-count process-group-contents-count'
                         });
 
                     // ----------------
@@ -623,14 +800,11 @@ nf.ProcessGroup = (function () {
                     // comments
                     // --------
 
-                    // process group comments
-                    details.append('text')
+                    details.append('path')
                         .attr({
-                            'x': 10,
-                            'y': 160,
-                            'width': 342,
-                            'height': 22,
-                            'class': 'process-group-comments'
+                            'class': 'component-comments',
+                            'transform': 'translate(' + (processGroupData.dimensions.width - 2) + ', ' + (processGroupData.dimensions.height - 10) + ')',
+                            'd': 'm0,0 l0,8 l-8,0 z'
                         });
 
                     // -------------------
@@ -696,6 +870,7 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.activeRemotePortCount;
                     });
+                transmittingCount.append("title").text("Transmitting Remote Process Groups");
 
                 // update not transmitting
                 var notTransmitting = details.select('text.process-group-not-transmitting')
@@ -717,6 +892,7 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.inactiveRemotePortCount;
                     });
+                notTransmittingCount.append("title").text("Not transmitting Remote Process Groups")
 
                 // update running
                 var running = details.select('text.process-group-running')
@@ -738,6 +914,7 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.runningCount;
                     });
+                runningCount.append("title").text("Running Components");
 
                 // update stopped
                 var stopped = details.select('text.process-group-stopped')
@@ -759,6 +936,7 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.stoppedCount;
                     });
+                stoppedCount.append("title").text("Stopped Components");
 
                 // update invalid
                 var invalid = details.select('text.process-group-invalid')
@@ -780,6 +958,7 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.invalidCount;
                     });
+                invalidCount.append("title").text("Invalid Components");
 
                 // update disabled
                 var disabled = details.select('text.process-group-disabled')
@@ -793,7 +972,7 @@ nf.ProcessGroup = (function () {
                         var invalidX = parseInt(invalidCount.attr('x'), 10);
                         return invalidX + Math.round(invalidCount.node().getComputedTextLength()) + CONTENTS_SPACER;
                     });
-                details.select('text.process-group-disabled-count')
+                var disabledCount = details.select('text.process-group-disabled-count')
                     .attr('x', function () {
                         var disabledCountX = parseInt(disabled.attr('x'), 10);
                         return disabledCountX + Math.round(disabled.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
@@ -801,26 +980,243 @@ nf.ProcessGroup = (function () {
                     .text(function (d) {
                         return d.disabledCount;
                     });
+                disabledCount.append("title").text("Disabled Components");
+
+                // up to date current
+                var upToDate = details.select('text.process-group-up-to-date')
+                    .classed('up-to-date', function (d) {
+                        return d.permissions.canRead && d.component.upToDateCount > 0;
+                    })
+                    .classed('zero', function (d) {
+                        return d.permissions.canRead && d.component.upToDateCount === 0;
+                    });
+                var upToDateCount = details.select('text.process-group-up-to-date-count')
+                    .attr('x', function () {
+                        var updateToDateCountX = parseInt(upToDate.attr('x'), 10);
+                        return updateToDateCountX + Math.round(upToDate.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                    })
+                    .text(function (d) {
+                        return d.upToDateCount;
+                    });
+                upToDateCount.append("title").text("Up to date Versioned Process Groups");
+
+                // update locally modified
+                var locallyModified = details.select('text.process-group-locally-modified')
+                    .classed('locally-modified', function (d) {
+                        return d.permissions.canRead && d.component.locallyModifiedCount > 0;
+                    })
+                    .classed('zero', function (d) {
+                        return d.permissions.canRead && d.component.locallyModifiedCount === 0;
+                    })
+                    .attr('x', function () {
+                        var upToDateX = parseInt(upToDateCount.attr('x'), 10);
+                        return upToDateX + Math.round(upToDateCount.node().getComputedTextLength()) + CONTENTS_SPACER;
+                    });
+                var locallyModifiedCount = details.select('text.process-group-locally-modified-count')
+                    .attr('x', function () {
+                        var locallyModifiedCountX = parseInt(locallyModified.attr('x'), 10);
+                        return locallyModifiedCountX + Math.round(locallyModified.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                    })
+                    .text(function (d) {
+                        return d.locallyModifiedCount;
+                    });
+                locallyModifiedCount.append("title").text("Locally modified Versioned Process Groups");
+
+                // update stale
+                var stale = details.select('text.process-group-stale')
+                    .classed('stale', function (d) {
+                        return d.permissions.canRead && d.component.staleCount > 0;
+                    })
+                    .classed('zero', function (d) {
+                        return d.permissions.canRead && d.component.staleCount === 0;
+                    })
+                    .attr('x', function () {
+                        var locallyModifiedX = parseInt(locallyModifiedCount.attr('x'), 10);
+                        return locallyModifiedX + Math.round(locallyModifiedCount.node().getComputedTextLength()) + CONTENTS_SPACER;
+                    });
+                var staleCount = details.select('text.process-group-stale-count')
+                    .attr('x', function () {
+                        var staleCountX = parseInt(stale.attr('x'), 10);
+                        return staleCountX + Math.round(stale.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                    })
+                    .text(function (d) {
+                        return d.staleCount;
+                    });
+                staleCount.append("title").text("Stale Versioned Process Groups");
+
+                // update locally modified and stale
+                var locallyModifiedAndStale = details.select('text.process-group-locally-modified-and-stale')
+                    .classed('locally-modified-and-stale', function (d) {
+                        return d.permissions.canRead && d.component.locallyModifiedAndStaleCount > 0;
+                    })
+                    .classed('zero', function (d) {
+                        return d.permissions.canRead && d.component.locallyModifiedAndStaleCount === 0;
+                    })
+                    .attr('x', function () {
+                        var staleX = parseInt(staleCount.attr('x'), 10);
+                        return staleX + Math.round(staleCount.node().getComputedTextLength()) + CONTENTS_SPACER;
+                    });
+                var locallyModifiedAndStaleCount = details.select('text.process-group-locally-modified-and-stale-count')
+                    .attr('x', function () {
+                        var locallyModifiedAndStaleCountX = parseInt(locallyModifiedAndStale.attr('x'), 10);
+                        return locallyModifiedAndStaleCountX + Math.round(locallyModifiedAndStale.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                    })
+                    .text(function (d) {
+                        return d.locallyModifiedAndStaleCount;
+                    });
+                locallyModifiedAndStaleCount.append("title").text("Locally modified and stale Versioned Process Groups");
+
+                // update sync failure
+                var syncFailure = details.select('text.process-group-sync-failure')
+                    .classed('sync-failure', function (d) {
+                        return d.permissions.canRead && d.component.syncFailureCount > 0;
+                    })
+                    .classed('zero', function (d) {
+                        return d.permissions.canRead && d.component.syncFailureCount === 0;
+                    })
+                    .attr('x', function () {
+                        var syncFailureX = parseInt(locallyModifiedAndStaleCount.attr('x'), 10);
+                        return syncFailureX + Math.round(locallyModifiedAndStaleCount.node().getComputedTextLength()) + CONTENTS_SPACER - 2;
+                    });
+                var syncFailureCount = details.select('text.process-group-sync-failure-count')
+                    .attr('x', function () {
+                        var syncFailureCountX = parseInt(syncFailure.attr('x'), 10);
+                        return syncFailureCountX + Math.round(syncFailure.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                    })
+                    .text(function (d) {
+                        return d.syncFailureCount;
+                    });
+                syncFailureCount.append("title").text("Sync failure Versioned Process Groups");
+
+                // update version control information
+                var versionControl = processGroup.select('text.version-control')
+                    .style({
+                        'visibility': isUnderVersionControl(processGroupData) ? 'visible' : 'hidden',
+                        'fill': function () {
+                            if (isUnderVersionControl(processGroupData)) {
+                                var vciState = processGroupData.versionedFlowState;
+                                if (vciState === 'SYNC_FAILURE') {
+                                    return '#666666';
+                                } else if (vciState === 'LOCALLY_MODIFIED_AND_STALE') {
+                                    return '#BA554A';
+                                } else if (vciState === 'STALE') {
+                                    return '#BA554A';
+                                } else if (vciState === 'LOCALLY_MODIFIED') {
+                                    return '#666666';
+                                } else {
+                                    return '#1A9964';
+                                }
+                            } else {
+                                return '#000';
+                            }
+                        }
+                    })
+                    .text(function () {
+                        if (isUnderVersionControl(processGroupData)) {
+                            var vciState = processGroupData.versionedFlowState;
+                            if (vciState === 'SYNC_FAILURE') {
+                                return '\uf128'
+                            } else if (vciState === 'LOCALLY_MODIFIED_AND_STALE') {
+                                return '\uf06a';
+                            } else if (vciState === 'STALE') {
+                                return '\uf0aa';
+                            } else if (vciState === 'LOCALLY_MODIFIED') {
+                                return '\uf069';
+                            } else {
+                                return '\uf00c';
+                            }
+                        } else {
+                            return '';
+                        }
+                    });
 
                 if (processGroupData.permissions.canRead) {
+                    // version control tooltip
+                    versionControl.each(function () {
+                            // get the tip
+                            var tip = d3.select('#version-control-tip-' + processGroupData.id);
+
+                            // if there are validation errors generate a tooltip
+                            if (isUnderVersionControl(processGroupData)) {
+                                // create the tip if necessary
+                                if (tip.empty()) {
+                                    tip = d3.select('#process-group-tooltips').append('div')
+                                        .attr('id', function () {
+                                            return 'version-control-tip-' + processGroupData.id;
+                                        })
+                                        .attr('class', 'tooltip nifi-tooltip');
+                                }
+
+                                // update the tip
+                                tip.html(function () {
+                                    var vci = processGroupData.component.versionControlInformation;
+                                    var versionControlTip = $('<div></div>').text('Tracking to "' + vci.flowName + '" version ' + vci.version + ' in "' + vci.registryName + ' - ' + vci.bucketName + '"');
+                                    var versionControlStateTip = $('<div></div>').text(nfCommon.getVersionControlTooltip(vci));
+                                    return $('<div></div>').append(versionControlTip).append('<br/>').append(versionControlStateTip).html();
+                                });
+
+                                // add the tooltip
+                                nfCanvasUtils.canvasTooltip(tip, d3.select(this));
+                            } else {
+                                // remove the tip if necessary
+                                if (!tip.empty()) {
+                                    tip.remove();
+                                }
+                            }
+                        });
+
                     // update the process group comments
-                    details.select('text.process-group-comments')
-                        .each(function (d) {
-                            var processGroupComments = d3.select(this);
+                    processGroup.select('path.component-comments')
+                        .style('visibility', nfCommon.isBlank(processGroupData.component.comments) ? 'hidden' : 'visible')
+                        .each(function () {
+                            // get the tip
+                            var tip = d3.select('#comments-tip-' + processGroupData.id);
 
-                            // reset the process group name to handle any previous state
-                            processGroupComments.text(null).selectAll('tspan, title').remove();
+                            // if there are validation errors generate a tooltip
+                            if (nfCommon.isBlank(processGroupData.component.comments)) {
+                                // remove the tip if necessary
+                                if (!tip.empty()) {
+                                    tip.remove();
+                                }
+                            } else {
+                                // create the tip if necessary
+                                if (tip.empty()) {
+                                    tip = d3.select('#process-group-tooltips').append('div')
+                                        .attr('id', function () {
+                                            return 'comments-tip-' + processGroupData.id;
+                                        })
+                                        .attr('class', 'tooltip nifi-tooltip');
+                                }
 
-                            // apply ellipsis to the port name as necessary
-                            nf.CanvasUtils.ellipsis(processGroupComments, getProcessGroupComments(d));
-                        }).classed('unset', function (d) {
-                        return nf.Common.isBlank(d.component.comments);
-                    }).append('title').text(function (d) {
-                        return getProcessGroupComments(d);
-                    });
+                                // update the tip
+                                tip.text(processGroupData.component.comments);
+
+                                // add the tooltip
+                                nfCanvasUtils.canvasTooltip(tip, d3.select(this));
+                            }
+                        });
 
                     // update the process group name
                     processGroup.select('text.process-group-name')
+                        .attr({
+                            'x': function () {
+                                if (isUnderVersionControl(processGroupData)) {
+                                    var versionControlX = parseInt(versionControl.attr('x'), 10);
+                                    return versionControlX + Math.round(versionControl.node().getComputedTextLength()) + CONTENTS_VALUE_SPACER;
+                                } else {
+                                    return 10;
+                                }
+                            },
+                            'width': function () {
+                                if (isUnderVersionControl(processGroupData)) {
+                                    var versionControlX = parseInt(versionControl.attr('x'), 10);
+                                    var processGroupNameX = parseInt(d3.select(this).attr('x'), 10);
+                                    return 316 - (processGroupNameX - versionControlX);
+                                } else {
+                                    return 316;
+                                }
+                            }
+                        })
                         .each(function (d) {
                             var processGroupName = d3.select(this);
 
@@ -828,16 +1224,26 @@ nf.ProcessGroup = (function () {
                             processGroupName.text(null).selectAll('title').remove();
 
                             // apply ellipsis to the process group name as necessary
-                            nf.CanvasUtils.ellipsis(processGroupName, d.component.name);
-                        }).append('title').text(function (d) {
-                        return d.component.name;
-                    });
+                            nfCanvasUtils.ellipsis(processGroupName, d.component.name);
+                        })
+                        .append('title')
+                        .text(function (d) {
+                            return d.component.name;
+                        });
                 } else {
                     // clear the process group comments
-                    details.select('text.process-group-comments').text(null);
+                    processGroup.select('path.component-comments').style('visibility', 'hidden');
 
                     // clear the process group name
-                    processGroup.select('text.process-group-name').text(null);
+                    processGroup.select('text.process-group-name')
+                        .attr({
+                            'x': 10,
+                            'width': 316
+                        })
+                        .text(null);
+
+                    // clear tooltips
+                    processGroup.call(removeTooltips);
                 }
 
                 // populate the stats
@@ -883,25 +1289,25 @@ nf.ProcessGroup = (function () {
         // queued count value
         updated.select('text.process-group-queued tspan.count')
             .text(function (d) {
-                return nf.Common.substringBeforeFirst(d.status.aggregateSnapshot.queued, ' ');
+                return nfCommon.substringBeforeFirst(d.status.aggregateSnapshot.queued, ' ');
             });
 
         // queued size value
         updated.select('text.process-group-queued tspan.size')
             .text(function (d) {
-                return ' ' + nf.Common.substringAfterFirst(d.status.aggregateSnapshot.queued, ' ');
+                return ' ' + nfCommon.substringAfterFirst(d.status.aggregateSnapshot.queued, ' ');
             });
 
         // in count value
         updated.select('text.process-group-in tspan.count')
             .text(function (d) {
-                return nf.Common.substringBeforeFirst(d.status.aggregateSnapshot.input, ' ');
+                return nfCommon.substringBeforeFirst(d.status.aggregateSnapshot.input, ' ');
             });
 
         // in size value
         updated.select('text.process-group-in tspan.size')
             .text(function (d) {
-                return ' ' + nf.Common.substringAfterFirst(d.status.aggregateSnapshot.input, ' ');
+                return ' ' + nfCommon.substringAfterFirst(d.status.aggregateSnapshot.input, ' ');
             });
 
         // in ports value
@@ -925,13 +1331,13 @@ nf.ProcessGroup = (function () {
         // out count value
         updated.select('text.process-group-out tspan.count')
             .text(function (d) {
-                return nf.Common.substringBeforeFirst(d.status.aggregateSnapshot.output, ' ');
+                return nfCommon.substringBeforeFirst(d.status.aggregateSnapshot.output, ' ');
             });
 
         // out size value
         updated.select('text.process-group-out tspan.size')
             .text(function (d) {
-                return ' ' + nf.Common.substringAfterFirst(d.status.aggregateSnapshot.output, ' ');
+                return ' ' + nfCommon.substringAfterFirst(d.status.aggregateSnapshot.output, ' ');
             });
 
         updated.each(function (d) {
@@ -942,7 +1348,7 @@ nf.ProcessGroup = (function () {
             // active thread count
             // -------------------
 
-            nf.CanvasUtils.activeThreadCount(processGroup, d, function (off) {
+            nfCanvasUtils.activeThreadCount(processGroup, d, function (off) {
                 offset = off;
             });
 
@@ -951,10 +1357,10 @@ nf.ProcessGroup = (function () {
             // ---------
 
             processGroup.select('rect.bulletin-background').classed('has-bulletins', function () {
-                return !nf.Common.isEmpty(d.status.aggregateSnapshot.bulletins);
+                return !nfCommon.isEmpty(d.status.aggregateSnapshot.bulletins);
             });
 
-            nf.CanvasUtils.bulletins(processGroup, d, function () {
+            nfCanvasUtils.bulletins(processGroup, d, function () {
                 return d3.select('#process-group-tooltips');
             }, offset);
         });
@@ -982,14 +1388,26 @@ nf.ProcessGroup = (function () {
         removed.each(function (d) {
             // remove any associated tooltips
             $('#bulletin-tip-' + d.id).remove();
+            $('#version-control-tip-' + d.id).remove();
+            $('#comments-tip-' + d.id).remove();
         });
     };
 
-    return {
+    var nfProcessGroup = {
         /**
          * Initializes of the Process Group handler.
+         *
+         * @param nfConnectableRef   The nfConnectable module.
+         * @param nfDraggableRef   The nfDraggable module.
+         * @param nfSelectableRef   The nfSelectable module.
+         * @param nfContextMenuRef   The nfContextMenu module.
          */
-        init: function () {
+        init: function (nfConnectableRef, nfDraggableRef, nfSelectableRef, nfContextMenuRef) {
+            nfConnectable = nfConnectableRef;
+            nfDraggable = nfDraggableRef;
+            nfSelectable = nfSelectableRef;
+            nfContextMenu = nfContextMenuRef;
+
             processGroupMap = d3.map();
             removedCache = d3.map();
             addedCache = d3.map();
@@ -1010,8 +1428,8 @@ nf.ProcessGroup = (function () {
          */
         add: function (processGroupEntities, options) {
             var selectAll = false;
-            if (nf.Common.isDefinedAndNotNull(options)) {
-                selectAll = nf.Common.isDefinedAndNotNull(options.selectAll) ? options.selectAll : selectAll;
+            if (nfCommon.isDefinedAndNotNull(options)) {
+                selectAll = nfCommon.isDefinedAndNotNull(options.selectAll) ? options.selectAll : selectAll;
             }
 
             // get the current time
@@ -1032,7 +1450,7 @@ nf.ProcessGroup = (function () {
                 $.each(processGroupEntities, function (_, processGroupEntity) {
                     add(processGroupEntity);
                 });
-            } else if (nf.Common.isDefinedAndNotNull(processGroupEntities)) {
+            } else if (nfCommon.isDefinedAndNotNull(processGroupEntities)) {
                 add(processGroupEntities);
             }
 
@@ -1051,16 +1469,18 @@ nf.ProcessGroup = (function () {
         set: function (processGroupEntities, options) {
             var selectAll = false;
             var transition = false;
-            if (nf.Common.isDefinedAndNotNull(options)) {
-                selectAll = nf.Common.isDefinedAndNotNull(options.selectAll) ? options.selectAll : selectAll;
-                transition = nf.Common.isDefinedAndNotNull(options.transition) ? options.transition : transition;
+            var overrideRevisionCheck = false;
+            if (nfCommon.isDefinedAndNotNull(options)) {
+                selectAll = nfCommon.isDefinedAndNotNull(options.selectAll) ? options.selectAll : selectAll;
+                transition = nfCommon.isDefinedAndNotNull(options.transition) ? options.transition : transition;
+                overrideRevisionCheck = nfCommon.isDefinedAndNotNull(options.overrideRevisionCheck) ? options.overrideRevisionCheck : overrideRevisionCheck;
             }
 
             var set = function (proposedProcessGroupEntity) {
                 var currentProcessGroupEntity = processGroupMap.get(proposedProcessGroupEntity.id);
 
                 // set the process group if appropriate due to revision and wasn't previously removed
-                if (nf.Client.isNewerRevision(currentProcessGroupEntity, proposedProcessGroupEntity) && !removedCache.has(proposedProcessGroupEntity.id)) {
+                if ((nfClient.isNewerRevision(currentProcessGroupEntity, proposedProcessGroupEntity) && !removedCache.has(proposedProcessGroupEntity.id)) || overrideRevisionCheck === true) {
                     processGroupMap.set(proposedProcessGroupEntity.id, $.extend({
                         type: 'ProcessGroup',
                         dimensions: dimensions
@@ -1084,14 +1504,14 @@ nf.ProcessGroup = (function () {
                 $.each(processGroupEntities, function (_, processGroupEntity) {
                     set(processGroupEntity);
                 });
-            } else if (nf.Common.isDefinedAndNotNull(processGroupEntities)) {
+            } else if (nfCommon.isDefinedAndNotNull(processGroupEntities)) {
                 set(processGroupEntities);
             }
 
             // apply the selection and handle all new process group
             var selection = select();
             selection.enter().call(renderProcessGroups, selectAll);
-            selection.call(updateProcessGroups).call(nf.CanvasUtils.position, transition);
+            selection.call(updateProcessGroups).call(nfCanvasUtils.position, transition);
             selection.exit().call(removeProcessGroups);
         },
 
@@ -1102,7 +1522,7 @@ nf.ProcessGroup = (function () {
          * @param {string} id
          */
         get: function (id) {
-            if (nf.Common.isUndefined(id)) {
+            if (nfCommon.isUndefined(id)) {
                 return processGroupMap.values();
             } else {
                 return processGroupMap.get(id);
@@ -1116,7 +1536,7 @@ nf.ProcessGroup = (function () {
          * @param {string} id      Optional
          */
         refresh: function (id) {
-            if (nf.Common.isDefinedAndNotNull(id)) {
+            if (nfCommon.isDefinedAndNotNull(id)) {
                 d3.select('#id-' + id).call(updateProcessGroups);
             } else {
                 d3.selectAll('g.process-group').call(updateProcessGroups);
@@ -1144,7 +1564,7 @@ nf.ProcessGroup = (function () {
                     url: processGroupEntity.uri,
                     dataType: 'json'
                 }).done(function (response) {
-                    nf.ProcessGroup.set(response);
+                    nfProcessGroup.set(response);
                 });
             }
         },
@@ -1155,7 +1575,7 @@ nf.ProcessGroup = (function () {
          * @param {string} id   The id
          */
         position: function (id) {
-            d3.select('#id-' + id).call(nf.CanvasUtils.position);
+            d3.select('#id-' + id).call(nfCanvasUtils.position);
         },
 
         /**
@@ -1184,7 +1604,7 @@ nf.ProcessGroup = (function () {
          * Removes all process groups.
          */
         removeAll: function () {
-            nf.ProcessGroup.remove(processGroupMap.keys());
+            nfProcessGroup.remove(processGroupMap.keys());
         },
 
         /**
@@ -1203,6 +1623,48 @@ nf.ProcessGroup = (function () {
 
             expire(addedCache);
             expire(removedCache);
+        },
+
+        /**
+         * Enters the specified group.
+         *
+         * @param {string} groupId
+         */
+        enterGroup: function (groupId) {
+
+            // hide the context menu
+            nfContextMenu.hide();
+
+            // set the new group id
+            nfCanvasUtils.setGroupId(groupId);
+
+            // reload the graph
+            return nfCanvasUtils.reload().done(function () {
+
+                // attempt to restore the view
+                var viewRestored = nfCanvasUtils.restoreUserView();
+
+                // if the view was not restore attempt to fit
+                if (viewRestored === false) {
+                    nfCanvasUtils.fitCanvasView();
+
+                    // refresh the canvas
+                    nfCanvasUtils.refreshCanvasView({
+                        transition: true
+                    });
+                }
+
+                // update URL deep linking params
+                nfCanvasUtils.setURLParameters(groupId, d3.select());
+
+            }).fail(function () {
+                nfDialog.showOkDialog({
+                    headerText: 'Process Group',
+                    dialogContent: 'Unable to enter the selected group.'
+                });
+            });
         }
     };
-}());
+
+    return nfProcessGroup;
+}));

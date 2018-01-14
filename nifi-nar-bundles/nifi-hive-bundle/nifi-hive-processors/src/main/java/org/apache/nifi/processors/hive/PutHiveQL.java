@@ -16,44 +16,46 @@
  */
 package org.apache.nifi.processors.hive;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.behavior.ReadsAttribute;
 import org.apache.nifi.annotation.behavior.ReadsAttributes;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.dbcp.hive.HiveDBCPService;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.ProcessSessionFactory;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.processor.io.InputStreamCallback;
 import org.apache.nifi.processor.util.StandardValidators;
-import org.apache.nifi.stream.io.StreamUtils;
+import org.apache.nifi.processor.util.pattern.ErrorTypes;
+import org.apache.nifi.processor.util.pattern.ExceptionHandler;
+import org.apache.nifi.processor.util.pattern.ExceptionHandler.OnError;
+import org.apache.nifi.processor.util.pattern.PartialFunctions.FetchFlowFiles;
+import org.apache.nifi.processor.util.pattern.PartialFunctions.InitConnection;
+import org.apache.nifi.processor.util.pattern.Put;
+import org.apache.nifi.processor.util.pattern.RollbackOnFailure;
+import org.apache.nifi.processor.util.pattern.RoutingResult;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.sql.Connection;
-import java.sql.Date;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientException;
-import java.sql.Time;
-import java.sql.Timestamp;
-import java.sql.Types;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @SeeAlso(SelectHiveQL.class)
@@ -69,6 +71,12 @@ import java.util.regex.Pattern;
         @ReadsAttribute(attribute = "hiveql.args.N.value", description = "Incoming FlowFiles are expected to be parametrized HiveQL statements. The value of the Parameters are specified as "
                 + "hiveql.args.1.value, hiveql.args.2.value, hiveql.args.3.value, and so on. The type of the hiveql.args.1.value Parameter is specified by the hiveql.args.1.type attribute.")
 })
+@WritesAttributes({
+        @WritesAttribute(attribute = "query.input.tables", description = "This attribute is written on the flow files routed to the 'success' relationships, "
+                + "and contains input table names (if any) in comma delimited 'databaseName.tableName' format."),
+        @WritesAttribute(attribute = "query.output.tables", description = "This attribute is written on the flow files routed to the 'success' relationships, "
+                + "and contains the target table names in 'databaseName.tableName' format.")
+})
 public class PutHiveQL extends AbstractHiveQLProcessor {
 
     public static final PropertyDescriptor BATCH_SIZE = new PropertyDescriptor.Builder()
@@ -80,13 +88,14 @@ public class PutHiveQL extends AbstractHiveQLProcessor {
             .defaultValue("100")
             .build();
 
-    public static final PropertyDescriptor CHARSET = new PropertyDescriptor.Builder()
-            .name("hive-charset")
-            .displayName("Character Set")
-            .description("Specifies the character set of the record data.")
+    public static final PropertyDescriptor STATEMENT_DELIMITER = new PropertyDescriptor.Builder()
+            .name("statement-delimiter")
+            .displayName("Statement Delimiter")
+            .description("Statement Delimiter used to separate SQL statements in a multiple statement script")
             .required(true)
-            .defaultValue("UTF-8")
-            .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
+            .defaultValue(";")
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(false)
             .build();
 
     public static final Relationship REL_SUCCESS = new Relationship.Builder()
@@ -103,14 +112,12 @@ public class PutHiveQL extends AbstractHiveQLProcessor {
                     + "such as an invalid query or an integrity constraint violation")
             .build();
 
-    private static final Pattern HIVEQL_TYPE_ATTRIBUTE_PATTERN = Pattern.compile("hiveql\\.args\\.(\\d+)\\.type");
-    private static final Pattern NUMBER_PATTERN = Pattern.compile("-?\\d+");
 
     private final static List<PropertyDescriptor> propertyDescriptors;
     private final static Set<Relationship> relationships;
 
     /*
-     * Will ensure that the list of property descriptors is build only once.
+     * Will ensure that the list of property descriptors is built only once.
      * Will also create a Set of relationships
      */
     static {
@@ -118,6 +125,8 @@ public class PutHiveQL extends AbstractHiveQLProcessor {
         _propertyDescriptors.add(HIVE_DBCP_SERVICE);
         _propertyDescriptors.add(BATCH_SIZE);
         _propertyDescriptors.add(CHARSET);
+        _propertyDescriptors.add(STATEMENT_DELIMITER);
+        _propertyDescriptors.add(RollbackOnFailure.ROLLBACK_ON_FAILURE);
         propertyDescriptors = Collections.unmodifiableList(_propertyDescriptors);
 
         Set<Relationship> _relationships = new HashSet<>();
@@ -125,6 +134,31 @@ public class PutHiveQL extends AbstractHiveQLProcessor {
         _relationships.add(REL_FAILURE);
         _relationships.add(REL_RETRY);
         relationships = Collections.unmodifiableSet(_relationships);
+    }
+
+    private Put<FunctionContext, Connection> process;
+    private ExceptionHandler<FunctionContext> exceptionHandler;
+
+    @OnScheduled
+    public void constructProcess() {
+        exceptionHandler = new ExceptionHandler<>();
+        exceptionHandler.mapException(e -> {
+            if (e instanceof SQLNonTransientException) {
+                return ErrorTypes.InvalidInput;
+            } else if (e instanceof SQLException) {
+                return ErrorTypes.TemporalFailure;
+            } else {
+                return ErrorTypes.UnknownFailure;
+            }
+        });
+        exceptionHandler.adjustError(RollbackOnFailure.createAdjustError(getLogger()));
+
+        process = new Put<>();
+        process.setLogger(getLogger());
+        process.initConnection(initConnection);
+        process.fetchFlowFiles(fetchFlowFiles);
+        process.putFlowFile(putFlowFile);
+        process.adjustRoute(RollbackOnFailure.createAdjustRoute(REL_FAILURE, REL_RETRY));
     }
 
     @Override
@@ -137,178 +171,106 @@ public class PutHiveQL extends AbstractHiveQLProcessor {
         return relationships;
     }
 
-    @Override
-    public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
-        final int batchSize = context.getProperty(BATCH_SIZE).asInteger();
-        final List<FlowFile> flowFiles = session.get(batchSize);
-
-        if (flowFiles.isEmpty()) {
-            return;
-        }
-
+    private class FunctionContext extends RollbackOnFailure {
+        final Charset charset;
+        final String statementDelimiter;
         final long startNanos = System.nanoTime();
-        final Charset charset = Charset.forName(context.getProperty(CHARSET).getValue());
-        final HiveDBCPService dbcpService = context.getProperty(HIVE_DBCP_SERVICE).asControllerService(HiveDBCPService.class);
-        try (final Connection conn = dbcpService.getConnection()) {
 
-            for (FlowFile flowFile : flowFiles) {
-                try {
-                    final String hiveQL = getHiveQL(session, flowFile, charset);
+        String connectionUrl;
+
+
+        private FunctionContext(boolean rollbackOnFailure, Charset charset, String statementDelimiter) {
+            super(rollbackOnFailure, false);
+            this.charset = charset;
+            this.statementDelimiter = statementDelimiter;
+        }
+    }
+
+    private InitConnection<FunctionContext, Connection> initConnection = (context, session, fc) -> {
+        final HiveDBCPService dbcpService = context.getProperty(HIVE_DBCP_SERVICE).asControllerService(HiveDBCPService.class);
+        final Connection connection = dbcpService.getConnection();
+        fc.connectionUrl = dbcpService.getConnectionURL();
+        return connection;
+    };
+
+    private FetchFlowFiles<FunctionContext> fetchFlowFiles = (context, session, functionContext, result) -> {
+        final int batchSize = context.getProperty(BATCH_SIZE).asInteger();
+        return session.get(batchSize);
+    };
+
+    private Put.PutFlowFile<FunctionContext, Connection> putFlowFile = (context, session, fc, conn, flowFile, result) -> {
+        final String script = getHiveQL(session, flowFile, fc.charset);
+        String regex = "(?<!\\\\)" + Pattern.quote(fc.statementDelimiter);
+
+        String[] hiveQLs = script.split(regex);
+
+        final Set<TableName> tableNames = new HashSet<>();
+        exceptionHandler.execute(fc, flowFile, input -> {
+            int loc = 1;
+            for (String hiveQLStr: hiveQLs) {
+                getLogger().debug("HiveQL: {}", new Object[]{hiveQLStr});
+
+                final String hiveQL = hiveQLStr.trim();
+                if (!StringUtils.isEmpty(hiveQL)) {
                     final PreparedStatement stmt = conn.prepareStatement(hiveQL);
-                    setParameters(stmt, flowFile.getAttributes());
+
+                    // Get ParameterMetadata
+                    // Hive JDBC Doesn't support this yet:
+                    // ParameterMetaData pmd = stmt.getParameterMetaData();
+                    // int paramCount = pmd.getParameterCount();
+                    int paramCount = StringUtils.countMatches(hiveQL, "?");
+
+                    if (paramCount > 0) {
+                        loc = setParameters(loc, stmt, paramCount, flowFile.getAttributes());
+                    }
+
+                    // Parse hiveQL and extract input/output tables
+                    try {
+                        tableNames.addAll(findTableNames(hiveQL));
+                    } catch (Exception e) {
+                        // If failed to parse the query, just log a warning message, but continue.
+                        getLogger().warn("Failed to parse hiveQL: {} due to {}", new Object[]{hiveQL, e}, e);
+                    }
 
                     // Execute the statement
                     stmt.execute();
-
-                    // Emit a Provenance SEND event
-                    final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
-                    session.getProvenanceReporter().send(flowFile, dbcpService.getConnectionURL(), transmissionMillis, true);
-                    session.transfer(flowFile, REL_SUCCESS);
-
-                } catch (final SQLException e) {
-
-                    if (e instanceof SQLNonTransientException) {
-                        getLogger().error("Failed to update Hive for {} due to {}; routing to failure", new Object[]{flowFile, e});
-                        session.transfer(flowFile, REL_FAILURE);
-                    } else {
-                        getLogger().error("Failed to update Hive for {} due to {}; it is possible that retrying the operation will succeed, so routing to retry", new Object[]{flowFile, e});
-                        flowFile = session.penalize(flowFile);
-                        session.transfer(flowFile, REL_RETRY);
-                    }
-
+                    fc.proceed();
                 }
             }
-        } catch (final SQLException sqle) {
-            // There was a problem getting the connection, yield and retry the flowfiles
-            getLogger().error("Failed to get Hive connection due to {}; it is possible that retrying the operation will succeed, so routing to retry", new Object[]{sqle});
-            session.transfer(flowFiles, REL_RETRY);
-            context.yield();
-        }
-    }
 
-    /**
-     * Determines the HiveQL statement that should be executed for the given FlowFile
-     *
-     * @param session  the session that can be used to access the given FlowFile
-     * @param flowFile the FlowFile whose HiveQL statement should be executed
-     * @return the HiveQL that is associated with the given FlowFile
-     */
-    private String getHiveQL(final ProcessSession session, final FlowFile flowFile, final Charset charset) {
-        // Read the HiveQL from the FlowFile's content
-        final byte[] buffer = new byte[(int) flowFile.getSize()];
-        session.read(flowFile, new InputStreamCallback() {
-            @Override
-            public void process(final InputStream in) throws IOException {
-                StreamUtils.fillBuffer(in, buffer);
+            // Emit a Provenance SEND event
+            final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - fc.startNanos);
+
+            final FlowFile updatedFlowFile = session.putAllAttributes(flowFile, toQueryTableAttributes(tableNames));
+            session.getProvenanceReporter().send(updatedFlowFile, fc.connectionUrl, transmissionMillis, true);
+            result.routeTo(flowFile, REL_SUCCESS);
+
+        }, onFlowFileError(context, session, result));
+
+    };
+
+    private OnError<FunctionContext, FlowFile> onFlowFileError(final ProcessContext context, final ProcessSession session, final RoutingResult result) {
+        OnError<FunctionContext, FlowFile> onFlowFileError = ExceptionHandler.createOnError(context, session, result, REL_FAILURE, REL_RETRY);
+        onFlowFileError = onFlowFileError.andThen((c, i, r, e) -> {
+            switch (r.destination()) {
+                case Failure:
+                    getLogger().error("Failed to update Hive for {} due to {}; routing to failure", new Object[] {i, e}, e);
+                    break;
+                case Retry:
+                    getLogger().error("Failed to update Hive for {} due to {}; it is possible that retrying the operation will succeed, so routing to retry",
+                            new Object[] {i, e}, e);
+                    break;
             }
         });
-
-        // Create the PreparedStatement to use for this FlowFile.
-        return new String(buffer, charset);
+        return RollbackOnFailure.createOnError(onFlowFileError);
     }
 
-
-    /**
-     * Sets all of the appropriate parameters on the given PreparedStatement, based on the given FlowFile attributes.
-     *
-     * @param stmt       the statement to set the parameters on
-     * @param attributes the attributes from which to derive parameter indices, values, and types
-     * @throws SQLException if the PreparedStatement throws a SQLException when the appropriate setter is called
-     */
-    private void setParameters(final PreparedStatement stmt, final Map<String, String> attributes) throws SQLException {
-        for (final Map.Entry<String, String> entry : attributes.entrySet()) {
-            final String key = entry.getKey();
-            final Matcher matcher = HIVEQL_TYPE_ATTRIBUTE_PATTERN.matcher(key);
-            if (matcher.matches()) {
-                final int parameterIndex = Integer.parseInt(matcher.group(1));
-
-                final boolean isNumeric = NUMBER_PATTERN.matcher(entry.getValue()).matches();
-                if (!isNumeric) {
-                    throw new ProcessException("Value of the " + key + " attribute is '" + entry.getValue() + "', which is not a valid JDBC numeral type");
-                }
-
-                final int jdbcType = Integer.parseInt(entry.getValue());
-                final String valueAttrName = "hiveql.args." + parameterIndex + ".value";
-                final String parameterValue = attributes.get(valueAttrName);
-
-                try {
-                    setParameter(stmt, valueAttrName, parameterIndex, parameterValue, jdbcType);
-                } catch (final NumberFormatException nfe) {
-                    throw new ProcessException("The value of the " + valueAttrName + " is '" + parameterValue + "', which cannot be converted into the necessary data type", nfe);
-                }
-            }
-        }
+    @Override
+    public void onTrigger(ProcessContext context, ProcessSessionFactory sessionFactory) throws ProcessException {
+        final Boolean rollbackOnFailure = context.getProperty(RollbackOnFailure.ROLLBACK_ON_FAILURE).asBoolean();
+        final Charset charset = Charset.forName(context.getProperty(CHARSET).getValue());
+        final String statementDelimiter = context.getProperty(STATEMENT_DELIMITER).getValue();
+        final FunctionContext functionContext = new FunctionContext(rollbackOnFailure, charset, statementDelimiter);
+        RollbackOnFailure.onTrigger(context, sessionFactory, functionContext, getLogger(), session -> process.onTrigger(context, session, functionContext));
     }
-
-    /**
-     * Determines how to map the given value to the appropriate JDBC data type and sets the parameter on the
-     * provided PreparedStatement
-     *
-     * @param stmt           the PreparedStatement to set the parameter on
-     * @param attrName       the name of the attribute that the parameter is coming from - for logging purposes
-     * @param parameterIndex the index of the HiveQL parameter to set
-     * @param parameterValue the value of the HiveQL parameter to set
-     * @param jdbcType       the JDBC Type of the HiveQL parameter to set
-     * @throws SQLException if the PreparedStatement throws a SQLException when calling the appropriate setter
-     */
-    private void setParameter(final PreparedStatement stmt, final String attrName, final int parameterIndex, final String parameterValue, final int jdbcType) throws SQLException {
-        if (parameterValue == null) {
-            stmt.setNull(parameterIndex, jdbcType);
-        } else {
-            try {
-                switch (jdbcType) {
-                    case Types.BIT:
-                    case Types.BOOLEAN:
-                        stmt.setBoolean(parameterIndex, Boolean.parseBoolean(parameterValue));
-                        break;
-                    case Types.TINYINT:
-                        stmt.setByte(parameterIndex, Byte.parseByte(parameterValue));
-                        break;
-                    case Types.SMALLINT:
-                        stmt.setShort(parameterIndex, Short.parseShort(parameterValue));
-                        break;
-                    case Types.INTEGER:
-                        stmt.setInt(parameterIndex, Integer.parseInt(parameterValue));
-                        break;
-                    case Types.BIGINT:
-                        stmt.setLong(parameterIndex, Long.parseLong(parameterValue));
-                        break;
-                    case Types.REAL:
-                        stmt.setFloat(parameterIndex, Float.parseFloat(parameterValue));
-                        break;
-                    case Types.FLOAT:
-                    case Types.DOUBLE:
-                        stmt.setDouble(parameterIndex, Double.parseDouble(parameterValue));
-                        break;
-                    case Types.DECIMAL:
-                    case Types.NUMERIC:
-                        stmt.setBigDecimal(parameterIndex, new BigDecimal(parameterValue));
-                        break;
-                    case Types.DATE:
-                        stmt.setDate(parameterIndex, new Date(Long.parseLong(parameterValue)));
-                        break;
-                    case Types.TIME:
-                        stmt.setTime(parameterIndex, new Time(Long.parseLong(parameterValue)));
-                        break;
-                    case Types.TIMESTAMP:
-                        stmt.setTimestamp(parameterIndex, new Timestamp(Long.parseLong(parameterValue)));
-                        break;
-                    case Types.CHAR:
-                    case Types.VARCHAR:
-                    case Types.LONGNVARCHAR:
-                    case Types.LONGVARCHAR:
-                        stmt.setString(parameterIndex, parameterValue);
-                        break;
-                    default:
-                        stmt.setObject(parameterIndex, parameterValue, jdbcType);
-                        break;
-                }
-            } catch (SQLException e) {
-                // Log which attribute/parameter had an error, then rethrow to be handled at the top level
-                getLogger().error("Error setting parameter {} to value from {} ({})", new Object[]{parameterIndex, attrName, parameterValue}, e);
-                throw e;
-            }
-        }
-    }
-
 }

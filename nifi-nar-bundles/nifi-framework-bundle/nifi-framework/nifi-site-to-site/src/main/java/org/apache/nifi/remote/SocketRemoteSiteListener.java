@@ -17,14 +17,20 @@
 package org.apache.nifi.remote;
 
 import org.apache.nifi.groups.ProcessGroup;
+import org.apache.nifi.remote.cluster.ClusterNodeInformation;
 import org.apache.nifi.remote.cluster.NodeInformant;
+import org.apache.nifi.remote.cluster.NodeInformation;
+import org.apache.nifi.remote.exception.BadRequestException;
 import org.apache.nifi.remote.exception.HandshakeException;
+import org.apache.nifi.remote.exception.NotAuthorizedException;
+import org.apache.nifi.remote.exception.RequestExpiredException;
 import org.apache.nifi.remote.io.socket.SocketChannelCommunicationsSession;
 import org.apache.nifi.remote.io.socket.ssl.SSLSocketChannel;
 import org.apache.nifi.remote.io.socket.ssl.SSLSocketChannelCommunicationsSession;
 import org.apache.nifi.remote.protocol.CommunicationsSession;
 import org.apache.nifi.remote.protocol.RequestType;
 import org.apache.nifi.remote.protocol.ServerProtocol;
+import org.apache.nifi.util.NiFiProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,12 +48,12 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
-import org.apache.nifi.remote.cluster.ClusterNodeInformation;
-import org.apache.nifi.util.NiFiProperties;
 
 public class SocketRemoteSiteListener implements RemoteSiteListener {
 
@@ -82,6 +88,7 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
     @Override
     public void start() throws IOException {
         final boolean secure = (sslContext != null);
+        final List<Thread> threads = new ArrayList<Thread>();
 
         final ServerSocketChannel serverSocketChannel = ServerSocketChannel.open();
         serverSocketChannel.configureBlocking(true);
@@ -128,8 +135,9 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
                     LOG.trace("Got connection");
 
                     if (stopped.get()) {
-                        return;
+                        break;
                     }
+
                     final Socket socket = acceptedSocket;
                     final SocketChannel socketChannel = socket.getChannel();
                     final Thread thread = new Thread(new Runnable() {
@@ -137,16 +145,16 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
                         public void run() {
                             LOG.debug("{} Determining URL of connection", this);
                             final InetAddress inetAddress = socket.getInetAddress();
-                            String hostname = inetAddress.getHostName();
-                            final int slashIndex = hostname.indexOf("/");
+                            String clientHostName = inetAddress.getHostName();
+                            final int slashIndex = clientHostName.indexOf("/");
                             if (slashIndex == 0) {
-                                hostname = hostname.substring(1);
+                                clientHostName = clientHostName.substring(1);
                             } else if (slashIndex > 0) {
-                                hostname = hostname.substring(0, slashIndex);
+                                clientHostName = clientHostName.substring(0, slashIndex);
                             }
 
-                            final int port = socket.getPort();
-                            final String peerUri = "nifi://" + hostname + ":" + port;
+                            final int clientPort = socket.getPort();
+                            final String peerUri = "nifi://" + clientHostName + ":" + clientPort;
                             LOG.debug("{} Connection URL is {}", this, peerUri);
 
                             final CommunicationsSession commsSession;
@@ -211,7 +219,7 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
                                 protocol.setRootProcessGroup(rootGroup.get());
                                 protocol.setNodeInformant(nodeInformant);
 
-                                final PeerDescription description = new PeerDescription("localhost", getPort(), sslContext != null);
+                                final PeerDescription description = new PeerDescription(clientHostName, clientPort, sslContext != null);
                                 peer = new Peer(description, commsSession, peerUri, "nifi://localhost:" + getPort());
                                 LOG.debug("Handshaking....");
                                 protocol.handshake(peer);
@@ -257,33 +265,7 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
                                             }
                                         }
 
-                                        LOG.debug("Request type from {} is {}", protocol, requestType);
-                                        switch (requestType) {
-                                            case NEGOTIATE_FLOWFILE_CODEC:
-                                                protocol.negotiateCodec(peer);
-                                                break;
-                                            case RECEIVE_FLOWFILES:
-                                                // peer wants to receive FlowFiles, so we will transfer FlowFiles.
-                                                protocol.getPort().transferFlowFiles(peer, protocol);
-                                                break;
-                                            case SEND_FLOWFILES:
-                                                // Peer wants to send FlowFiles, so we will receive.
-                                                protocol.getPort().receiveFlowFiles(peer, protocol);
-                                                break;
-                                            case REQUEST_PEER_LIST:
-                                                final Optional<ClusterNodeInformation> nodeInfo = (nodeInformant == null) ? Optional.empty() : Optional.of(nodeInformant.getNodeInformation());
-                                                protocol.sendPeerList(
-                                                        peer,
-                                                        nodeInfo,
-                                                        nifiProperties.getRemoteInputHost(),
-                                                        nifiProperties.getRemoteInputPort(),
-                                                        nifiProperties.getRemoteInputHttpPort(),
-                                                        nifiProperties.isSiteToSiteSecure());
-                                                break;
-                                            case SHUTDOWN:
-                                                protocol.shutdown(peer);
-                                                break;
-                                        }
+                                        handleRequest(protocol, peer, requestType);
                                     }
                                     LOG.debug("Finished communicating with {} ({})", peer, protocol);
                                 } catch (final Exception e) {
@@ -326,11 +308,57 @@ public class SocketRemoteSiteListener implements RemoteSiteListener {
                     thread.setName("Site-to-Site Worker Thread-" + (threadCount++));
                     LOG.debug("Handing connection to {}", thread);
                     thread.start();
+                    threads.add(thread);
+                    threads.removeIf(t -> !t.isAlive());
+                }
+
+                for(Thread thread : threads) {
+                    if(thread != null) {
+                        thread.interrupt();
+                    }
                 }
             }
         });
         listenerThread.setName("Site-to-Site Listener");
         listenerThread.start();
+    }
+
+    private void handleRequest(final ServerProtocol protocol, final Peer peer, final RequestType requestType)
+            throws IOException, NotAuthorizedException, BadRequestException, RequestExpiredException {
+        LOG.debug("Request type from {} is {}", protocol, requestType);
+        switch (requestType) {
+            case NEGOTIATE_FLOWFILE_CODEC:
+                protocol.negotiateCodec(peer);
+                break;
+            case RECEIVE_FLOWFILES:
+                // peer wants to receive FlowFiles, so we will transfer FlowFiles.
+                protocol.getPort().transferFlowFiles(peer, protocol);
+                break;
+            case SEND_FLOWFILES:
+                // Peer wants to send FlowFiles, so we will receive.
+                protocol.getPort().receiveFlowFiles(peer, protocol);
+                break;
+            case REQUEST_PEER_LIST:
+                final Optional<ClusterNodeInformation> nodeInfo = (nodeInformant == null) ? Optional.empty() : Optional.of(nodeInformant.getNodeInformation());
+
+                String remoteInputHostVal = nifiProperties.getRemoteInputHost();
+                if (remoteInputHostVal == null) {
+                    remoteInputHostVal = InetAddress.getLocalHost().getHostName();
+                }
+                final Boolean isSiteToSiteSecure = nifiProperties.isSiteToSiteSecure();
+                final Integer apiPort = isSiteToSiteSecure ? nifiProperties.getSslPort() : nifiProperties.getPort();
+                final NodeInformation self = new NodeInformation(remoteInputHostVal,
+                        nifiProperties.getRemoteInputPort(),
+                        nifiProperties.getRemoteInputHttpPort(),
+                        apiPort != null ? apiPort : 0, // Avoid potential NullPointerException.
+                        isSiteToSiteSecure, 0); // TotalFlowFiles doesn't matter if it's a standalone NiFi.
+
+                protocol.sendPeerList(peer, nodeInfo, self);
+                break;
+            case SHUTDOWN:
+                protocol.shutdown(peer);
+                break;
+        }
     }
 
     private int getPort() {

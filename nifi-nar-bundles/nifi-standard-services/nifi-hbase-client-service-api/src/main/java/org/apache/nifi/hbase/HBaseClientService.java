@@ -95,6 +95,28 @@ public interface HBaseClientService extends ControllerService {
     void put(String tableName, byte[] rowId, Collection<PutColumn> columns) throws IOException;
 
     /**
+     * Atomically checks if a row/family/qualifier value matches the expected value. If it does, then the Put is added to HBase.
+     *
+     * @param tableName the name of an HBase table
+     * @param rowId the id of the row to check
+     * @param family the family of the row to check
+     * @param qualifier the qualifier of the row to check
+     * @param value the value of the row to check. If null, the check is for the lack of column (ie: non-existence)
+     * @return True if the Put was executed, false otherwise
+     * @throws IOException thrown when there are communication errors with HBase$
+     */
+    boolean checkAndPut(String tableName, byte[] rowId, byte[] family, byte[] qualifier, byte[] value, PutColumn column) throws IOException;
+
+    /**
+     * Deletes the given row on HBase. All cells are deleted.
+     *
+     * @param tableName the name of an HBase table
+     * @param rowId the id of the row to delete
+     * @throws IOException thrown when there are communication errors with HBase
+     */
+    void delete(String tableName, byte[] rowId) throws IOException;
+
+    /**
      * Scans the given table using the optional filter criteria and passing each result to the provided handler.
      *
      * @param tableName the name of an HBase table to scan
@@ -107,12 +129,41 @@ public interface HBaseClientService extends ControllerService {
     void scan(String tableName, Collection<Column> columns, String filterExpression, long minTime, ResultHandler handler) throws IOException;
 
     /**
+     * Scans the given table for the given rowId and passes the result to the handler.
+     *
+     * @param tableName the name of an HBase table to scan
+     * @param startRow the row identifier to start scanning at
+     * @param endRow the row identifier to end scanning at
+     * @param columns optional columns to return, if not specified all columns are returned
+     * @param handler a handler to process rows of the result
+     * @throws IOException thrown when there are communication errors with HBase
+     */
+    void scan(String tableName, byte[] startRow, byte[] endRow, Collection<Column> columns, ResultHandler handler) throws IOException;
+
+    /**
      * Converts the given boolean to it's byte representation.
      *
      * @param b a boolean
      * @return the boolean represented as bytes
      */
     byte[] toBytes(boolean b);
+
+    /**
+     * Converts the given float to its byte representation.
+     *
+     * @param f a float
+     * @return the float represented as bytes
+     */
+    byte[] toBytes(float f);
+
+
+    /**
+     * Converts the given float to its byte representation.
+     *
+     * @param i an int
+     * @return the int represented as bytes
+     */
+    byte[] toBytes(int i);
 
     /**
      * Converts the given long to it's byte representation.
@@ -144,5 +195,16 @@ public interface HBaseClientService extends ControllerService {
      * @return the string represented as bytes
      */
     byte[] toBytesBinary(String s);
+
+    /**
+     * Create a transit URI from the current configuration and the specified table name.
+     * The default implementation just prepend "hbase://" to the table name and row key, i.e. "hbase://tableName/rowKey".
+     * @param tableName The name of a HBase table
+     * @param rowKey The target HBase row key, this can be null or empty string if the operation is not targeted to a specific row
+     * @return a qualified transit URI which can identify a HBase table row in a HBase cluster
+     */
+    default String toTransitUri(String tableName, String rowKey) {
+        return "hbase://" + tableName + (rowKey != null && !rowKey.isEmpty() ? "/" + rowKey : "");
+    }
 
 }

@@ -16,6 +16,7 @@
  */
 package org.apache.nifi.processors.script
 
+import org.apache.nifi.script.ScriptingComponentUtils
 import org.apache.nifi.util.MockFlowFile
 import org.apache.nifi.util.StopWatch
 import org.apache.nifi.util.TestRunners
@@ -49,9 +50,9 @@ class ExecuteScriptGroovyTest extends BaseScriptTest {
         super.setupExecuteScript()
 
         runner.setValidateExpressionUsage(false)
-        runner.setProperty(ExecuteScript.SCRIPT_ENGINE, "Groovy")
-        runner.setProperty(ExecuteScript.SCRIPT_FILE, TEST_RESOURCE_LOCATION + "groovy/testAddTimeAndThreadAttribute.groovy")
-        runner.setProperty(ExecuteScript.MODULES, TEST_RESOURCE_LOCATION + "groovy")
+        runner.setProperty(scriptingComponent.getScriptingComponentHelper().SCRIPT_ENGINE, "Groovy")
+        runner.setProperty(ScriptingComponentUtils.SCRIPT_FILE, TEST_RESOURCE_LOCATION + "groovy/testAddTimeAndThreadAttribute.groovy")
+        runner.setProperty(ScriptingComponentUtils.MODULES, TEST_RESOURCE_LOCATION + "groovy")
     }
 
     @After
@@ -65,9 +66,9 @@ class ExecuteScriptGroovyTest extends BaseScriptTest {
         assertNotNull(executeScript.getSupportedPropertyDescriptors())
         runner = TestRunners.newTestRunner(executeScript)
         runner.setValidateExpressionUsage(false)
-        runner.setProperty(ExecuteScript.SCRIPT_ENGINE, "Groovy")
-        runner.setProperty(ExecuteScript.SCRIPT_FILE, TEST_RESOURCE_LOCATION + "groovy/testAddTimeAndThreadAttribute.groovy")
-        runner.setProperty(ExecuteScript.MODULES, TEST_RESOURCE_LOCATION + "groovy")
+        runner.setProperty(scriptingComponent.getScriptingComponentHelper().SCRIPT_ENGINE, "Groovy")
+        runner.setProperty(ScriptingComponentUtils.SCRIPT_FILE, TEST_RESOURCE_LOCATION + "groovy/testAddTimeAndThreadAttribute.groovy")
+        runner.setProperty(ScriptingComponentUtils.MODULES, TEST_RESOURCE_LOCATION + "groovy")
 
         // Override userContext value
         runner.processContext.maxConcurrentTasks = poolSize

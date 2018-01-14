@@ -80,6 +80,16 @@ public interface ProvenanceEventRecord {
     Map<String, String> getAttributes();
 
     /**
+     * Returns the attribute with the given name
+     *
+     * @param attributeName the name of the attribute to get
+     * @return the attribute with the given name or <code>null</code> if no attribute exists with the given name
+     */
+    default String getAttribute(String attributeName) {
+        return getAttributes().get(attributeName);
+    }
+
+    /**
      * @return all FlowFile attributes that existed on the FlowFile before this
      * event occurred
      */
@@ -178,28 +188,24 @@ public interface ProvenanceEventRecord {
      * {@link ProvenanceEventType#FORK}, {@link ProvenanceEventType#JOIN}, or
      * {@link ProvenanceEventType#CLONE}), or if the queue identifier is
      * unknown, then this method will return <code>null</code>
-     *
      */
     String getSourceQueueIdentifier();
 
     /**
      * @return the Section for the Content Claim that this Event refers to, if
      * any; otherwise, returns <code>null</code>
-     *
      */
     String getContentClaimSection();
 
     /**
      * @return the Section for the Content Claim that the FlowFile previously
      * referenced, if any; otherwise, returns <code>null</code>
-     *
      */
     String getPreviousContentClaimSection();
 
     /**
      * @return the Container for the Content Claim that this Event refers to, if
      * any; otherwise, returns <code>null</code>
-     *
      */
     String getContentClaimContainer();
 
@@ -212,28 +218,31 @@ public interface ProvenanceEventRecord {
     /**
      * @return the Identifier for the Content Claim that this Event refers to,
      * if any; otherwise, returns <code>null</code>
-     *
      */
     String getContentClaimIdentifier();
 
     /**
      * @return the Identifier for the Content Claim that the FlowFile previously
      * referenced, if any; otherwise, returns <code>null</code>
-     *
      */
     String getPreviousContentClaimIdentifier();
 
     /**
      * @return the offset into the Content Claim at which the FlowFile's content
      * begins, if any; otherwise, returns <code>null</code>
-     *
      */
     Long getContentClaimOffset();
 
     /**
      * @return the offset into the Content Claim at which the FlowFile's
      * previous content began, if any; otherwise, returns <code>null</code>
-     *
      */
     Long getPreviousContentClaimOffset();
+
+    /**
+     * Returns the best event identifier for this event (eventId if available, descriptive identifier if not yet persisted to allow for traceability).
+     *
+     * @return a descriptive event ID to allow tracing
+     */
+    String getBestEventIdentifier();
 }

@@ -16,8 +16,6 @@
  */
 package org.apache.nifi.processors.standard;
 
-import javax.servlet.http.HttpServletResponse;
-
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.reporting.InitializationException;
@@ -31,6 +29,7 @@ import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import javax.servlet.http.HttpServletResponse;
 import java.net.URLEncoder;
 import java.util.HashMap;
 import java.util.Map;
@@ -246,6 +245,40 @@ public class TestGetHTTP {
     }
 
     @Test
+    public final void testDynamicHeaders() throws Exception {
+        // set up web service
+        ServletHandler handler = new ServletHandler();
+        handler.addServletWithMapping(UserAgentTestingServlet.class, "/*");
+
+        // create the service
+        TestServer server = new TestServer();
+        server.addHandler(handler);
+
+        try {
+            server.startServer();
+
+            String destination = server.getUrl();
+
+            // set up NiFi mock controller
+            controller = TestRunners.newTestRunner(GetHTTP.class);
+            controller.setProperty(GetHTTP.CONNECTION_TIMEOUT, "5 secs");
+            controller.setProperty(GetHTTP.URL, destination);
+            controller.setProperty(GetHTTP.FILENAME, "testFile");
+            controller.setProperty(GetHTTP.ACCEPT_CONTENT_TYPE, "application/json");
+            controller.setProperty(GetHTTP.USER_AGENT, "testUserAgent");
+            controller.setProperty("Static-Header", "StaticHeaderValue");
+            controller.setProperty("EL-Header", "${now()}");
+
+            controller.run();
+            controller.assertTransferCount(GetHTTP.REL_SUCCESS, 1);
+
+            // shutdown web service
+        } finally {
+            server.shutdownServer();
+        }
+    }
+
+    @Test
     public final void testExpressionLanguage() throws Exception {
         // set up web service
         ServletHandler handler = new ServletHandler();
@@ -290,7 +323,6 @@ public class TestGetHTTP {
         // set up web service
         ServletHandler handler = new ServletHandler();
         handler.addServletWithMapping(HttpErrorServlet.class, "/*");
-        HttpErrorServlet servlet = (HttpErrorServlet) handler.getServlets()[0].getServlet();
 
         // create the service
         TestServer server = new TestServer();
@@ -298,6 +330,7 @@ public class TestGetHTTP {
 
         try {
             server.startServer();
+            HttpErrorServlet servlet = (HttpErrorServlet) handler.getServlets()[0].getServlet();
             String destination = server.getUrl();
 
             this.controller = TestRunners.newTestRunner(GetHTTP.class);

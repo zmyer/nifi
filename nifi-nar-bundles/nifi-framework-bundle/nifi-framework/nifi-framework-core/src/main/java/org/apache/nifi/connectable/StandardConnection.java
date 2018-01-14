@@ -47,6 +47,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -71,6 +72,7 @@ public final class StandardConnection implements Connection {
     private final StandardFlowFileQueue flowFileQueue;
     private final AtomicInteger labelIndex = new AtomicInteger(1);
     private final AtomicLong zIndex = new AtomicLong(0L);
+    private final AtomicReference<String> versionedComponentId = new AtomicReference<>();
     private final ProcessScheduler scheduler;
     private final int hashCode;
 
@@ -110,7 +112,7 @@ public final class StandardConnection implements Connection {
 
     @Override
     public Authorizable getParentAuthorizable() {
-        return null;
+        return getProcessGroup();
     }
 
     @Override
@@ -135,6 +137,11 @@ public final class StandardConnection implements Connection {
                 }
 
                 return name;
+            }
+
+            @Override
+            public String getSafeDescription() {
+                return "Connection " + StandardConnection.this.getIdentifier();
             }
         };
     }
@@ -172,7 +179,7 @@ public final class StandardConnection implements Connection {
     @Override
     public AuthorizationResult checkAuthorization(Authorizer authorizer, RequestAction action, NiFiUser user, Map<String, String> resourceContext) {
         if (user == null) {
-            return AuthorizationResult.denied("Unknown user");
+            return AuthorizationResult.denied("Unknown user.");
         }
 
         // check the source
@@ -188,7 +195,7 @@ public final class StandardConnection implements Connection {
     @Override
     public void authorize(Authorizer authorizer, RequestAction action, NiFiUser user, Map<String, String> resourceContext) throws AccessDeniedException {
         if (user == null) {
-            throw new AccessDeniedException("Unknown user");
+            throw new AccessDeniedException("Unknown user.");
         }
 
         getSourceAuthorizable().authorize(authorizer, action, user, resourceContext);
@@ -263,8 +270,10 @@ public final class StandardConnection implements Connection {
             return;
         }
 
-        if (getSource().isRunning()) {
-            throw new IllegalStateException("Cannot update the relationships for Connection because the source of the Connection is running");
+        try {
+            getSource().verifyCanUpdate();
+        } catch (final IllegalStateException ise) {
+            throw new IllegalStateException("Cannot update the relationships for Connection", ise);
         }
 
         try {
@@ -317,6 +326,11 @@ public final class StandardConnection implements Connection {
     @Override
     public List<FlowFileRecord> poll(final FlowFileFilter filter, final Set<FlowFileRecord> expiredRecords) {
         return flowFileQueue.poll(filter, expiredRecords);
+    }
+
+    @Override
+    public FlowFileRecord poll(final Set<FlowFileRecord> expiredRecords) {
+        return flowFileQueue.poll(expiredRecords);
     }
 
     @Override
@@ -506,6 +520,29 @@ public final class StandardConnection implements Connection {
         if (dest.isRunning()) {
             if (!ConnectableType.FUNNEL.equals(dest.getConnectableType())) {
                 throw new IllegalStateException("Destination of Connection (" + dest.getIdentifier() + ") is running");
+            }
+        }
+    }
+
+    @Override
+    public Optional<String> getVersionedComponentId() {
+        return Optional.ofNullable(versionedComponentId.get());
+    }
+
+    @Override
+    public void setVersionedComponentId(final String versionedComponentId) {
+        boolean updated = false;
+        while (!updated) {
+            final String currentId = this.versionedComponentId.get();
+
+            if (currentId == null) {
+                updated = this.versionedComponentId.compareAndSet(null, versionedComponentId);
+            } else if (currentId.equals(versionedComponentId)) {
+                return;
+            } else if (versionedComponentId == null) {
+                updated = this.versionedComponentId.compareAndSet(currentId, null);
+            } else {
+                throw new IllegalStateException(this + " is already under version control");
             }
         }
     }

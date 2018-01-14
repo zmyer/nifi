@@ -70,6 +70,10 @@
     min-height: 150px;
 }
 
+#queue-listing-table div.slick-viewport {
+    overflow-x: hidden !important;
+}
+
 /* queue listing table */
 
 #queue-listing-message {
@@ -113,7 +117,7 @@ div.detail-name {
     color: #262626;
 }
 
-div.detail-value {
+div.detail-value, div.flowfile-info {
     line-height: normal;
     width: 100%;
     color: #775351;

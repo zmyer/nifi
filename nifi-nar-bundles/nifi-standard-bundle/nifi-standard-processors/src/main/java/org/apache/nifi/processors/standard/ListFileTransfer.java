@@ -26,6 +26,7 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.processor.util.list.AbstractListProcessor;
 import org.apache.nifi.processors.standard.util.FileInfo;
 import org.apache.nifi.processors.standard.util.FileTransfer;
 import java.util.Map;
@@ -78,6 +79,7 @@ public abstract class ListFileTransfer extends AbstractListProcessor<FileInfo> {
         attributes.put(ListFile.FILE_PERMISSIONS_ATTRIBUTE, fileInfo.getPermissions());
         attributes.put(ListFile.FILE_OWNER_ATTRIBUTE, fileInfo.getOwner());
         attributes.put(ListFile.FILE_GROUP_ATTRIBUTE, fileInfo.getGroup());
+        attributes.put(ListFile.FILE_SIZE_ATTRIBUTE, Long.toString(fileInfo.getSize()));
         attributes.put(CoreAttributes.FILENAME.key(), fileInfo.getFileName());
         final String fullPath = fileInfo.getFullPathFileName();
         if (fullPath != null) {
@@ -92,7 +94,7 @@ public abstract class ListFileTransfer extends AbstractListProcessor<FileInfo> {
 
     @Override
     protected String getPath(final ProcessContext context) {
-        return context.getProperty(REMOTE_PATH).getValue();
+        return context.getProperty(REMOTE_PATH).evaluateAttributeExpressions().getValue();
     }
 
     @Override

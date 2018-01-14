@@ -39,15 +39,17 @@ public interface FileTransfer extends Closeable {
 
     void flush() throws IOException;
 
+    boolean flush(FlowFile flowFile) throws IOException;
+
     FileInfo getRemoteFileInfo(FlowFile flowFile, String path, String remoteFileName) throws IOException;
 
     String put(FlowFile flowFile, String path, String filename, InputStream content) throws IOException;
 
-    void rename(String source, String target) throws IOException;
+    void rename(FlowFile flowFile, String source, String target) throws IOException;
 
-    void deleteFile(String path, String remoteFileName) throws IOException;
+    void deleteFile(FlowFile flowFile, String path, String remoteFileName) throws IOException;
 
-    void deleteDirectory(String remoteDirectoryName) throws IOException;
+    void deleteDirectory(FlowFile flowFile, String remoteDirectoryName) throws IOException;
 
     boolean isClosed();
 
@@ -67,6 +69,7 @@ public interface FileTransfer extends Closeable {
         .description("Username")
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .required(true)
+        .expressionLanguageSupported(true)
         .build();
     public static final PropertyDescriptor PASSWORD = new PropertyDescriptor.Builder()
         .name("Password")
@@ -74,6 +77,7 @@ public interface FileTransfer extends Closeable {
         .addValidator(Validator.VALID)
         .required(false)
         .sensitive(true)
+        .expressionLanguageSupported(true)
         .build();
     public static final PropertyDescriptor DATA_TIMEOUT = new PropertyDescriptor.Builder()
         .name("Data Timeout")

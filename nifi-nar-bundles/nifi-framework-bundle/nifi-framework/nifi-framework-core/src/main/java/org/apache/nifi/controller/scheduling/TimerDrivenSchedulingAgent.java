@@ -37,7 +37,6 @@ import org.apache.nifi.engine.FlowEngine;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.StandardProcessContext;
 import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.registry.VariableRegistry;
 import org.apache.nifi.util.FormatUtils;
 import org.apache.nifi.util.NiFiProperties;
 import org.slf4j.Logger;
@@ -51,7 +50,6 @@ public class TimerDrivenSchedulingAgent extends AbstractSchedulingAgent {
     private final FlowController flowController;
     private final ProcessContextFactory contextFactory;
     private final StringEncryptor encryptor;
-    private final VariableRegistry variableRegistry;
 
     private volatile String adminYieldDuration = "1 sec";
 
@@ -60,13 +58,11 @@ public class TimerDrivenSchedulingAgent extends AbstractSchedulingAgent {
             final FlowEngine flowEngine,
             final ProcessContextFactory contextFactory,
             final StringEncryptor encryptor,
-            final VariableRegistry variableRegistry,
             final NiFiProperties nifiProperties) {
         super(flowEngine);
         this.flowController = flowController;
         this.contextFactory = contextFactory;
         this.encryptor = encryptor;
-        this.variableRegistry = variableRegistry;
 
         final String boredYieldDuration = nifiProperties.getBoredYieldDuration();
         try {
@@ -109,7 +105,7 @@ public class TimerDrivenSchedulingAgent extends AbstractSchedulingAgent {
             // Determine the task to run and create it.
             if (connectable.getConnectableType() == ConnectableType.PROCESSOR) {
                 final ProcessorNode procNode = (ProcessorNode) connectable;
-                final StandardProcessContext standardProcContext = new StandardProcessContext(procNode, flowController, encryptor, getStateManager(connectable.getIdentifier()), variableRegistry);
+                final StandardProcessContext standardProcContext = new StandardProcessContext(procNode, flowController, encryptor, getStateManager(connectable.getIdentifier()));
                 final ContinuallyRunProcessorTask runnableTask = new ContinuallyRunProcessorTask(this, procNode, flowController,
                         contextFactory, scheduleState, standardProcContext);
 
@@ -139,8 +135,10 @@ public class TimerDrivenSchedulingAgent extends AbstractSchedulingAgent {
                     // If the component is yielded, cancel its future and re-submit it to run again
                     // after the yield has expired.
                     final long newYieldExpiration = connectable.getYieldExpiration();
-                    if (newYieldExpiration > System.currentTimeMillis()) {
-                        final long yieldMillis = newYieldExpiration - System.currentTimeMillis();
+                    final long now = System.currentTimeMillis();
+                    if (newYieldExpiration > now) {
+                        final long yieldMillis = newYieldExpiration - now;
+                        final long scheduleMillis = connectable.getSchedulingPeriod(TimeUnit.MILLISECONDS);
                         final ScheduledFuture<?> scheduledFuture = futureRef.get();
                         if (scheduledFuture == null) {
                             return;
@@ -150,7 +148,7 @@ public class TimerDrivenSchedulingAgent extends AbstractSchedulingAgent {
                         // an accurate accounting of which futures are outstanding; we must then also update the futureRef
                         // so that we can do this again the next time that the component is yielded.
                         if (scheduledFuture.cancel(false)) {
-                            final long yieldNanos = TimeUnit.MILLISECONDS.toNanos(yieldMillis);
+                            final long yieldNanos = Math.max(TimeUnit.MILLISECONDS.toNanos(scheduleMillis), TimeUnit.MILLISECONDS.toNanos(yieldMillis));
 
                             synchronized (scheduleState) {
                                 if (scheduleState.isScheduled()) {

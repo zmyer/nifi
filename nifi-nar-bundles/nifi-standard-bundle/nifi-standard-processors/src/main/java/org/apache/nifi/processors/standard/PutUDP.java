@@ -37,6 +37,7 @@ import org.apache.nifi.processor.io.InputStreamCallback;
 import org.apache.nifi.processor.util.put.AbstractPutEventProcessor;
 import org.apache.nifi.processor.util.put.sender.ChannelSender;
 import org.apache.nifi.stream.io.StreamUtils;
+import org.apache.nifi.util.StopWatch;
 
 /**
  * <p>
@@ -91,8 +92,8 @@ public class PutUDP extends AbstractPutEventProcessor {
     @Override
     protected ChannelSender createSender(final ProcessContext context) throws IOException {
         final String protocol = UDP_VALUE.getValue();
-        final String hostname = context.getProperty(HOSTNAME).getValue();
-        final int port = context.getProperty(PORT).asInteger();
+        final String hostname = context.getProperty(HOSTNAME).evaluateAttributeExpressions().getValue();
+        final int port = context.getProperty(PORT).evaluateAttributeExpressions().asInteger();
         final int bufferSize = context.getProperty(MAX_SOCKET_SEND_BUFFER_SIZE).asDataSize(DataUnit.B).intValue();
 
         return createSender(protocol, hostname, port, 0, bufferSize, null);
@@ -109,8 +110,8 @@ public class PutUDP extends AbstractPutEventProcessor {
     @Override
     protected String createTransitUri(final ProcessContext context) {
         final String protocol = UDP_VALUE.getValue();
-        final String host = context.getProperty(HOSTNAME).getValue();
-        final String port = context.getProperty(PORT).getValue();
+        final String host = context.getProperty(HOSTNAME).evaluateAttributeExpressions().getValue();
+        final String port = context.getProperty(PORT).evaluateAttributeExpressions().getValue();
 
         return new StringBuilder().append(protocol).append("://").append(host).append(":").append(port).toString();
     }
@@ -130,8 +131,11 @@ public class PutUDP extends AbstractPutEventProcessor {
         final ProcessSession session = sessionFactory.createSession();
         final FlowFile flowFile = session.get();
         if (flowFile == null) {
-            pruneIdleSenders(context.getProperty(IDLE_EXPIRATION).asTimePeriod(TimeUnit.MILLISECONDS).longValue());
-            context.yield();
+            final PruneResult result = pruneIdleSenders(context.getProperty(IDLE_EXPIRATION).asTimePeriod(TimeUnit.MILLISECONDS).longValue());
+            // yield if we closed an idle connection, or if there were no connections in the first place
+            if (result.getNumClosed() > 0 || (result.getNumClosed() == 0 && result.getNumConsidered() == 0)) {
+                context.yield();
+            }
             return;
         }
 
@@ -142,7 +146,9 @@ public class PutUDP extends AbstractPutEventProcessor {
 
         try {
             byte[] content = readContent(session, flowFile);
+            StopWatch stopWatch = new StopWatch(true);
             sender.send(content);
+            session.getProvenanceReporter().send(flowFile, transitUri, stopWatch.getElapsed(TimeUnit.MILLISECONDS));
             session.transfer(flowFile, REL_SUCCESS);
             session.commit();
         } catch (Exception e) {

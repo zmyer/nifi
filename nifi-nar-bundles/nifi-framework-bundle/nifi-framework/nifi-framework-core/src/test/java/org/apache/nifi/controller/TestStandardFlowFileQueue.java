@@ -63,6 +63,7 @@ import org.apache.nifi.provenance.ProvenanceEventRecord;
 import org.apache.nifi.provenance.ProvenanceEventRepository;
 import org.apache.nifi.provenance.ProvenanceEventType;
 import org.apache.nifi.provenance.StandardProvenanceEventRecord;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -73,6 +74,12 @@ import org.mockito.stubbing.Answer;
 public class TestStandardFlowFileQueue {
     private TestSwapManager swapManager = null;
     private StandardFlowFileQueue queue = null;
+
+    private Connection connection = null;
+    private FlowFileRepository flowFileRepo = null;
+    private ProvenanceEventRepository provRepo = null;
+    private ResourceClaimManager claimManager = null;
+    private ProcessScheduler scheduler = null;
 
     private List<ProvenanceEventRecord> provRecords = new ArrayList<>();
 
@@ -86,16 +93,16 @@ public class TestStandardFlowFileQueue {
     public void setup() {
         provRecords.clear();
 
-        final Connection connection = Mockito.mock(Connection.class);
+        connection = Mockito.mock(Connection.class);
         Mockito.when(connection.getSource()).thenReturn(Mockito.mock(Connectable.class));
         Mockito.when(connection.getDestination()).thenReturn(Mockito.mock(Connectable.class));
 
-        final ProcessScheduler scheduler = Mockito.mock(ProcessScheduler.class);
+        scheduler = Mockito.mock(ProcessScheduler.class);
         swapManager = new TestSwapManager();
 
-        final FlowFileRepository flowFileRepo = Mockito.mock(FlowFileRepository.class);
-        final ProvenanceEventRepository provRepo = Mockito.mock(ProvenanceEventRepository.class);
-        final ResourceClaimManager claimManager = Mockito.mock(ResourceClaimManager.class);
+        flowFileRepo = Mockito.mock(FlowFileRepository.class);
+        provRepo = Mockito.mock(ProvenanceEventRepository.class);
+        claimManager = Mockito.mock(ResourceClaimManager.class);
 
         Mockito.when(provRepo.eventBuilder()).thenReturn(new StandardProvenanceEventRecord.Builder());
         Mockito.doAnswer(new Answer<Object>() {
@@ -383,6 +390,55 @@ public class TestStandardFlowFileQueue {
     }
 
     @Test
+    public void testSwapInWhenThresholdIsLessThanSwapSize() {
+        // create a queue where the swap threshold is less than 10k
+        queue = new StandardFlowFileQueue("id", connection, flowFileRepo, provRepo, claimManager, scheduler, swapManager, null, 1000);
+
+        for (int i = 1; i <= 20000; i++) {
+            queue.put(new TestFlowFile());
+        }
+
+        assertEquals(1, swapManager.swappedOut.size());
+        queue.put(new TestFlowFile());
+        assertEquals(1, swapManager.swappedOut.size());
+
+        final Set<FlowFileRecord> exp = new HashSet<>();
+
+        // At this point there should be:
+        // 1k flow files in the active queue
+        // 9,001 flow files in the swap queue
+        // 10k flow files swapped to disk
+
+        for (int i = 0; i < 999; i++) { //
+            final FlowFileRecord flowFile = queue.poll(exp);
+            assertNotNull(flowFile);
+            assertEquals(1, queue.getUnacknowledgedQueueSize().getObjectCount());
+            assertEquals(1, queue.getUnacknowledgedQueueSize().getByteCount());
+
+            queue.acknowledge(Collections.singleton(flowFile));
+            assertEquals(0, queue.getUnacknowledgedQueueSize().getObjectCount());
+            assertEquals(0, queue.getUnacknowledgedQueueSize().getByteCount());
+        }
+
+        assertEquals(0, swapManager.swapInCalledCount);
+        assertEquals(1, queue.getActiveQueueSize().getObjectCount());
+        assertNotNull(queue.poll(exp));
+
+        assertEquals(0, swapManager.swapInCalledCount);
+        assertEquals(0, queue.getActiveQueueSize().getObjectCount());
+
+        assertEquals(1, swapManager.swapOutCalledCount);
+
+        assertNotNull(queue.poll(exp)); // this should trigger a swap-in of 10,000 records, and then pull 1 off the top.
+        assertEquals(1, swapManager.swapInCalledCount);
+        assertEquals(9999, queue.getActiveQueueSize().getObjectCount());
+
+        assertTrue(swapManager.swappedOut.isEmpty());
+
+        queue.poll(exp);
+    }
+
+    @Test
     public void testQueueCountsUpdatedWhenIncompleteSwapFile() {
         for (int i = 1; i <= 20000; i++) {
             queue.put(new TestFlowFile());
@@ -528,12 +584,75 @@ public class TestStandardFlowFileQueue {
     }
 
 
+    @Test
+    public void testOOMEFollowedBySuccessfulSwapIn() {
+        final List<FlowFileRecord> flowFiles = new ArrayList<>();
+        for (int i = 0; i < 50000; i++) {
+            flowFiles.add(new TestFlowFile());
+        }
+
+        queue.putAll(flowFiles);
+
+        swapManager.failSwapInAfterN = 2;
+        swapManager.setSwapInFailure(new OutOfMemoryError("Intentional OOME for unit test"));
+
+        final Set<FlowFileRecord> expiredRecords = new HashSet<>();
+        for (int i = 0; i < 30000; i++) {
+            final FlowFileRecord polled = queue.poll(expiredRecords);
+            assertNotNull(polled);
+        }
+
+        // verify that unexpected ERROR's are handled in such a way that we keep retrying
+        for (int i = 0; i < 3; i++) {
+            try {
+                queue.poll(expiredRecords);
+                Assert.fail("Expected OOME to be thrown");
+            } catch (final OutOfMemoryError oome) {
+                // expected
+            }
+        }
+
+        // verify that unexpected Runtime Exceptions are handled in such a way that we keep retrying
+        swapManager.setSwapInFailure(new NullPointerException("Intentional OOME for unit test"));
+
+        for (int i = 0; i < 3; i++) {
+            try {
+                queue.poll(expiredRecords);
+                Assert.fail("Expected NPE to be thrown");
+            } catch (final NullPointerException npe) {
+                // expected
+            }
+        }
+
+        swapManager.failSwapInAfterN = -1;
+
+        for (int i = 0; i < 20000; i++) {
+            final FlowFileRecord polled = queue.poll(expiredRecords);
+            assertNotNull(polled);
+        }
+
+        queue.acknowledge(flowFiles);
+        assertNull(queue.poll(expiredRecords));
+        assertEquals(0, queue.getActiveQueueSize().getObjectCount());
+        assertEquals(0, queue.size().getObjectCount());
+
+        assertTrue(swapManager.swappedOut.isEmpty());
+    }
+
+
     private class TestSwapManager implements FlowFileSwapManager {
         private final Map<String, List<FlowFileRecord>> swappedOut = new HashMap<>();
         int swapOutCalledCount = 0;
         int swapInCalledCount = 0;
 
         private int incompleteSwapFileRecordsToInclude = -1;
+
+        private int failSwapInAfterN = -1;
+        private Throwable failSwapInFailure = null;
+
+        private void setSwapInFailure(final Throwable t) {
+            this.failSwapInFailure = t;
+        }
 
         @Override
         public void initialize(final SwapManagerInitializationContext initializationContext) {
@@ -566,6 +685,17 @@ public class TestStandardFlowFileQueue {
                 final List<FlowFileRecord> partial = records.subList(0, incompleteSwapFileRecordsToInclude);
                 final SwapContents partialContents = new StandardSwapContents(summary, partial);
                 throw new IncompleteSwapFileException(swapLocation, partialContents);
+            }
+
+            if (swapInCalledCount > failSwapInAfterN && failSwapInAfterN > -1) {
+                if (failSwapInFailure instanceof RuntimeException) {
+                    throw (RuntimeException) failSwapInFailure;
+                }
+                if (failSwapInFailure instanceof Error) {
+                    throw (Error) failSwapInFailure;
+                }
+
+                throw new RuntimeException(failSwapInFailure);
             }
         }
 

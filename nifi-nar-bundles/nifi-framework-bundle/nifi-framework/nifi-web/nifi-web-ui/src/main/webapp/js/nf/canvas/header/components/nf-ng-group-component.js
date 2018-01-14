@@ -15,229 +15,294 @@
  * limitations under the License.
  */
 
-/* global nf, d3 */
+/* global define, module, require, exports */
 
-nf.ng.GroupComponent = function (serviceProvider) {
+(function (root, factory) {
+    if (typeof define === 'function' && define.amd) {
+        define(['jquery',
+                'nf.Client',
+                'nf.Birdseye',
+                'nf.Graph',
+                'nf.CanvasUtils',
+                'nf.ErrorHandler',
+                'nf.Common',
+                'nf.Dialog'],
+            function ($, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfCommon, nfDialog) {
+                return (nf.ng.GroupComponent = factory($, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfCommon, nfDialog));
+            });
+    } else if (typeof exports === 'object' && typeof module === 'object') {
+        module.exports = (nf.ng.GroupComponent =
+            factory(require('jquery'),
+                require('nf.Client'),
+                require('nf.Birdseye'),
+                require('nf.Graph'),
+                require('nf.CanvasUtils'),
+                require('nf.ErrorHandler'),
+                require('nf.Common'),
+                require('nf.Dialog')));
+    } else {
+        nf.ng.GroupComponent = factory(root.$,
+            root.nf.Client,
+            root.nf.Birdseye,
+            root.nf.Graph,
+            root.nf.CanvasUtils,
+            root.nf.ErrorHandler,
+            root.nf.Common,
+            root.nf.Dialog);
+    }
+}(this, function ($, nfClient, nfBirdseye, nfGraph, nfCanvasUtils, nfErrorHandler, nfCommon, nfDialog) {
     'use strict';
 
-    /**
-     * Create the group and add to the graph.
-     *
-     * @argument {string} groupName The name of the group.
-     * @argument {object} pt        The point that the group was dropped.
-     */
-    var createGroup = function (groupName, pt) {
-        var processGroupEntity = {
-            'revision': nf.Client.getRevision({
-                'revision': {
-                    'version': 0
-                }
-            }),
-            'component': {
-                'name': groupName,
-                'position': {
-                    'x': pt.x,
-                    'y': pt.y
-                }
-            }
-        };
-
-        // create a new processor of the defined type
-        return $.ajax({
-            type: 'POST',
-            url: serviceProvider.headerCtrl.toolboxCtrl.config.urls.api + '/process-groups/' + encodeURIComponent(nf.Canvas.getGroupId()) + '/process-groups',
-            data: JSON.stringify(processGroupEntity),
-            dataType: 'json',
-            contentType: 'application/json'
-        }).done(function (response) {
-            // add the process group to the graph
-            nf.Graph.add({
-                'processGroups': [response]
-            }, {
-                'selectAll': true
-            });
-
-            // update component visibility
-            nf.Canvas.View.updateVisibility();
-
-            // update the birdseye
-            nf.Birdseye.refresh();
-        }).fail(nf.Common.handleAjaxError);
-    };
-
-    function GroupComponent() {
-
-        this.icon = 'icon icon-group';
-
-        this.hoverIcon = 'icon icon-group-add';
+    return function (serviceProvider) {
+        'use strict';
 
         /**
-         * The group component's modal.
+         * Create the group and add to the graph.
+         *
+         * @argument {string} groupName The name of the group.
+         * @argument {object} pt        The point that the group was dropped.
          */
-        this.modal = {
+        var createGroup = function (groupName, pt) {
+            var processGroupEntity = {
+                'revision': nfClient.getRevision({
+                    'revision': {
+                        'version': 0
+                    }
+                }),
+                'component': {
+                    'name': groupName,
+                    'position': {
+                        'x': pt.x,
+                        'y': pt.y
+                    }
+                }
+            };
+
+            // create a new processor of the defined type
+            return $.ajax({
+                type: 'POST',
+                url: serviceProvider.headerCtrl.toolboxCtrl.config.urls.api + '/process-groups/' + encodeURIComponent(nfCanvasUtils.getGroupId()) + '/process-groups',
+                data: JSON.stringify(processGroupEntity),
+                dataType: 'json',
+                contentType: 'application/json'
+            }).done(function (response) {
+                // add the process group to the graph
+                nfGraph.add({
+                    'processGroups': [response]
+                }, {
+                    'selectAll': true
+                });
+
+                // update component visibility
+                nfGraph.updateVisibility();
+
+                // update the birdseye
+                nfBirdseye.refresh();
+            }).fail(nfErrorHandler.handleAjaxError);
+        };
+
+        function GroupComponent() {
+
+            this.icon = 'icon icon-group';
+
+            this.hoverIcon = 'icon icon-group-add';
 
             /**
-             * Gets the modal element.
+             * The group component's modal.
+             */
+            this.modal = {
+
+                /**
+                 * Gets the modal element.
+                 *
+                 * @returns {*|jQuery|HTMLElement}
+                 */
+                getElement: function () {
+                    return $('#new-process-group-dialog');
+                },
+
+                /**
+                 * Initialize the modal.
+                 */
+                init: function () {
+                    // configure the new process group dialog
+                    this.getElement().modal({
+                        scrollableContentStyle: 'scrollable',
+                        headerText: 'Add Process Group',
+                        handler: {
+                            close: function () {
+                                $('#new-process-group-name').val('');
+                                $('#new-process-group-dialog').removeData('pt');
+                            }
+                        }
+                    });
+                },
+
+                /**
+                 * Updates the modal config.
+                 *
+                 * @param {string} name             The name of the property to update.
+                 * @param {object|array} config     The config for the `name`.
+                 */
+                update: function (name, config) {
+                    this.getElement().modal(name, config);
+                },
+
+                /**
+                 * Show the modal.
+                 */
+                show: function () {
+                    this.getElement().modal('show');
+                },
+
+                /**
+                 * Stores the pt.
+                 *
+                 * @param pt
+                 */
+                storePt: function (pt) {
+                    $('#new-process-group-dialog').data('pt', pt);
+                },
+
+                /**
+                 * Hide the modal.
+                 */
+                hide: function () {
+                    this.getElement().modal('hide');
+                }
+            };
+        }
+
+        GroupComponent.prototype = {
+            constructor: GroupComponent,
+
+            /**
+             * Gets the component.
              *
              * @returns {*|jQuery|HTMLElement}
              */
             getElement: function () {
-                return $('#new-process-group-dialog');
+                return $('#group-component');
             },
 
             /**
-             * Initialize the modal.
+             * Enable the component.
              */
-            init: function () {
-                // configure the new process group dialog
-                this.getElement().modal({
-                    scrollableContentStyle: 'scrollable',
-                    headerText: 'Add Process Group',
-                    handler: {
-                        close: function () {
-                            $('#new-process-group-name').val('');
-                        }
-                    }
-                });
+            enabled: function () {
+                this.getElement().attr('disabled', false);
             },
 
             /**
-             * Updates the modal config.
+             * Disable the component.
+             */
+            disabled: function () {
+                this.getElement().attr('disabled', true);
+            },
+
+            /**
+             * Handler function for when component is dropped on the canvas.
              *
-             * @param {string} name             The name of the property to update.
-             * @param {object|array} config     The config for the `name`.
+             * @argument {object} pt        The point that the component was dropped.
              */
-            update: function (name, config) {
-                this.getElement().modal(name, config);
+            dropHandler: function (pt) {
+                this.promptForGroupName(pt, true);
             },
 
             /**
-             * Show the modal.
+             * The drag icon for the toolbox component.
+             *
+             * @param event
+             * @returns {*|jQuery|HTMLElement}
              */
-            show: function () {
-                this.getElement().modal('show');
+            dragIcon: function (event) {
+                return $('<div class="icon icon-group-add"></div>');
             },
 
             /**
-             * Hide the modal.
+             * Prompts the user to enter the name for the group.
+             *
+             * @argument {object} pt        The point that the group was dropped.
+             * @argument {boolean} showImportLink Whether we should show the import link
              */
-            hide: function () {
-                this.getElement().modal('hide');
-            }
-        };
-    }
+            promptForGroupName: function (pt, showImportLink) {
+                var groupComponent = this;
+                return $.Deferred(function (deferred) {
+                    var addGroup = function () {
+                        // get the name of the group and clear the textfield
+                        var groupName = $('#new-process-group-name').val();
 
-    GroupComponent.prototype = {
-        constructor: GroupComponent,
+                        // hide the dialog
+                        groupComponent.modal.hide();
 
-        /**
-         * Gets the component.
-         *
-         * @returns {*|jQuery|HTMLElement}
-         */
-        getElement: function () {
-            return $('#group-component');
-        },
+                        // ensure the group name is specified
+                        if (nfCommon.isBlank(groupName)) {
+                            nfDialog.showOkDialog({
+                                headerText: 'Create Process Group',
+                                dialogContent: 'The group name is required.'
+                            });
 
-        /**
-         * Enable the component.
-         */
-        enabled: function () {
-            this.getElement().attr('disabled', false);
-        },
+                            deferred.reject();
+                        } else {
+                            // create the group and resolve the deferred accordingly
+                            createGroup(groupName, pt).done(function (response) {
+                                deferred.resolve(response.component);
+                            }).fail(function () {
+                                deferred.reject();
+                            });
+                        }
+                    };
 
-        /**
-         * Disable the component.
-         */
-        disabled: function () {
-            this.getElement().attr('disabled', true);
-        },
-
-        /**
-         * Handler function for when component is dropped on the canvas.
-         *
-         * @argument {object} pt        The point that the component was dropped.
-         */
-        dropHandler: function (pt) {
-            this.promptForGroupName(pt);
-        },
-
-        /**
-         * The drag icon for the toolbox component.
-         *
-         * @param event
-         * @returns {*|jQuery|HTMLElement}
-         */
-        dragIcon: function (event) {
-            return $('<div class="icon icon-group-add"></div>');
-        },
-
-        /**
-         * Prompts the user to enter the name for the group.
-         *
-         * @argument {object} pt        The point that the group was dropped.
-         */
-        promptForGroupName: function (pt) {
-            var self = this;
-            return $.Deferred(function (deferred) {
-                var addGroup = function () {
-                    // get the name of the group and clear the textfield
-                    var groupName = $('#new-process-group-name').val();
-
-                    // hide the dialog
-                    self.modal.hide();
-
-                    // create the group and resolve the deferred accordingly
-                    createGroup(groupName, pt).done(function (response) {
-                        deferred.resolve(response.component);
-                    }).fail(function () {
-                        deferred.reject();
-                    });
-                };
-
-                self.modal.update('setButtonModel', [{
-                    buttonText: 'Add',
-                    color: {
-                        base: '#728E9B',
-                        hover: '#004849',
-                        text: '#ffffff'
-                    },
-                    handler: {
-                        click: addGroup
-                    }
-                },
-                    {
-                        buttonText: 'Cancel',
+                    groupComponent.modal.update('setButtonModel', [{
+                        buttonText: 'Add',
                         color: {
-                            base: '#E3E8EB',
-                            hover: '#C7D2D7',
-                            text: '#004849'
+                            base: '#728E9B',
+                            hover: '#004849',
+                            text: '#ffffff'
                         },
                         handler: {
-                            click: function () {
-                                // reject the deferred
-                                deferred.reject();
-
-                                // close the dialog
-                                self.modal.hide();
-                            }
+                            click: addGroup
                         }
-                    }]);
+                    },
+                        {
+                            buttonText: 'Cancel',
+                            color: {
+                                base: '#E3E8EB',
+                                hover: '#C7D2D7',
+                                text: '#004849'
+                            },
+                            handler: {
+                                click: function () {
+                                    // reject the deferred
+                                    deferred.reject();
 
-                // show the dialog
-                self.modal.show();
+                                    // close the dialog
+                                    groupComponent.modal.hide();
+                                }
+                            }
+                        }]);
 
-                // set up the focus and key handlers
-                $('#new-process-group-name').focus().off('keyup').on('keyup', function (e) {
-                    var code = e.keyCode ? e.keyCode : e.which;
-                    if (code === $.ui.keyCode.ENTER) {
-                        addGroup();
+                    if (showImportLink === true && nfCommon.canVersionFlows()) {
+                        $('#import-process-group-link').show();
+                    } else {
+                        $('#import-process-group-link').hide();
                     }
-                });
-            }).promise();
-        }
-    }
 
-    var groupComponent = new GroupComponent();
-    return groupComponent;
-};
+                    // show the dialog
+                    groupComponent.modal.storePt(pt);
+                    groupComponent.modal.show();
+
+                    // set up the focus and key handlers
+                    $('#new-process-group-name').focus().off('keyup').on('keyup', function (e) {
+                        var code = e.keyCode ? e.keyCode : e.which;
+                        if (code === $.ui.keyCode.ENTER) {
+                            addGroup();
+                        }
+                    });
+                }).promise();
+            }
+        }
+
+        var groupComponent = new GroupComponent();
+        return groupComponent;
+    };
+}));

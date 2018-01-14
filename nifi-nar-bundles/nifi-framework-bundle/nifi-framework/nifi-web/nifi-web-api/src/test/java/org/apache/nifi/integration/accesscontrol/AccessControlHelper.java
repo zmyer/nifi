@@ -16,15 +16,17 @@
  */
 package org.apache.nifi.integration.accesscontrol;
 
-import com.sun.jersey.api.client.ClientResponse;
+import org.apache.nifi.bundle.Bundle;
 import org.apache.nifi.integration.NiFiWebApiTest;
 import org.apache.nifi.integration.util.NiFiTestAuthorizer;
 import org.apache.nifi.integration.util.NiFiTestServer;
 import org.apache.nifi.integration.util.NiFiTestUser;
 import org.apache.nifi.nar.ExtensionManager;
 import org.apache.nifi.nar.NarClassLoaders;
+import org.apache.nifi.nar.SystemBundle;
 import org.apache.nifi.util.NiFiProperties;
 
+import javax.ws.rs.core.Response;
 import java.io.File;
 
 import static org.junit.Assert.assertEquals;
@@ -63,8 +65,9 @@ public class AccessControlHelper {
         flowXmlPath = props.getProperty(NiFiProperties.FLOW_CONFIGURATION_FILE);
 
         // load extensions
+        final Bundle systemBundle = SystemBundle.create(props);
         NarClassLoaders.getInstance().init(props.getFrameworkWorkingDirectory(), props.getExtensionsWorkingDirectory());
-        ExtensionManager.discoverExtensions(NarClassLoaders.getInstance().getExtensionClassLoaders());
+        ExtensionManager.discoverExtensions(systemBundle, NarClassLoaders.getInstance().getBundles());
 
         // start the server
         server = new NiFiTestServer("src/main/webapp", CONTEXT_PATH, props);
@@ -106,7 +109,7 @@ public class AccessControlHelper {
     }
 
     public void testGenericGetUri(final String uri) throws Exception {
-        ClientResponse response;
+        Response response;
 
         // read
         response = getReadUser().testGet(uri);

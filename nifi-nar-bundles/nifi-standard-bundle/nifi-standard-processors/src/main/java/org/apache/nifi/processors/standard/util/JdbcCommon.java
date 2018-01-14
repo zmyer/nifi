@@ -33,6 +33,7 @@ import static java.sql.Types.LONGNVARCHAR;
 import static java.sql.Types.LONGVARBINARY;
 import static java.sql.Types.LONGVARCHAR;
 import static java.sql.Types.NCHAR;
+import static java.sql.Types.NCLOB;
 import static java.sql.Types.NUMERIC;
 import static java.sql.Types.NVARCHAR;
 import static java.sql.Types.REAL;
@@ -47,24 +48,36 @@ import static java.sql.Types.VARCHAR;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.Reader;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.nio.CharBuffer;
 import java.sql.Blob;
 import java.sql.Clob;
+import java.sql.NClob;
 import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
+import java.util.Date;
+import java.util.function.Function;
 
+import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
+import org.apache.avro.SchemaBuilder.BaseTypeBuilder;
 import org.apache.avro.SchemaBuilder.FieldAssembler;
+import org.apache.avro.SchemaBuilder.NullDefault;
+import org.apache.avro.SchemaBuilder.UnionAccumulator;
 import org.apache.avro.file.DataFileWriter;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.DatumWriter;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.nifi.avro.AvroTypeUtil;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.processor.util.StandardValidators;
 
 /**
  * JDBC / SQL common functions.
@@ -73,6 +86,68 @@ public class JdbcCommon {
 
     private static final int MAX_DIGITS_IN_BIGINT = 19;
     private static final int MAX_DIGITS_IN_INT = 9;
+    // Derived from MySQL default precision.
+    private static final int DEFAULT_PRECISION_VALUE = 10;
+    private static final int DEFAULT_SCALE_VALUE = 0;
+
+    public static final String MIME_TYPE_AVRO_BINARY = "application/avro-binary";
+
+    public static final PropertyDescriptor NORMALIZE_NAMES_FOR_AVRO = new PropertyDescriptor.Builder()
+            .name("dbf-normalize")
+            .displayName("Normalize Table/Column Names")
+            .description("Whether to change non-Avro-compatible characters in column names to Avro-compatible characters. For example, colons and periods "
+                    + "will be changed to underscores in order to build a valid Avro record.")
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .required(true)
+            .build();
+
+    public static final PropertyDescriptor USE_AVRO_LOGICAL_TYPES = new PropertyDescriptor.Builder()
+            .name("dbf-user-logical-types")
+            .displayName("Use Avro Logical Types")
+            .description("Whether to use Avro Logical Types for DECIMAL/NUMBER, DATE, TIME and TIMESTAMP columns. "
+                    + "If disabled, written as string. "
+                    + "If enabled, Logical types are used and written as its underlying type, specifically, "
+                    + "DECIMAL/NUMBER as logical 'decimal': written as bytes with additional precision and scale meta data, "
+                    + "DATE as logical 'date-millis': written as int denoting days since Unix epoch (1970-01-01), "
+                    + "TIME as logical 'time-millis': written as int denoting milliseconds since Unix epoch, "
+                    + "and TIMESTAMP as logical 'timestamp-millis': written as long denoting milliseconds since Unix epoch. "
+                    + "If a reader of written Avro records also knows these logical types, then these values can be deserialized with more context depending on reader implementation.")
+            .allowableValues("true", "false")
+            .defaultValue("false")
+            .required(true)
+            .build();
+
+    public static final PropertyDescriptor DEFAULT_PRECISION = new PropertyDescriptor.Builder()
+            .name("dbf-default-precision")
+            .displayName("Default Decimal Precision")
+            .description("When a DECIMAL/NUMBER value is written as a 'decimal' Avro logical type,"
+                    + " a specific 'precision' denoting number of available digits is required."
+                    + " Generally, precision is defined by column data type definition or database engines default."
+                    + " However undefined precision (0) can be returned from some database engines."
+                    + " 'Default Decimal Precision' is used when writing those undefined precision numbers.")
+            .defaultValue(String.valueOf(DEFAULT_PRECISION_VALUE))
+            .addValidator(StandardValidators.POSITIVE_INTEGER_VALIDATOR)
+            .expressionLanguageSupported(true)
+            .required(true)
+            .build();
+
+    public static final PropertyDescriptor DEFAULT_SCALE = new PropertyDescriptor.Builder()
+            .name("dbf-default-scale")
+            .displayName("Default Decimal Scale")
+            .description("When a DECIMAL/NUMBER value is written as a 'decimal' Avro logical type,"
+                    + " a specific 'scale' denoting number of available decimal digits is required."
+                    + " Generally, scale is defined by column data type definition or database engines default."
+                    + " However when undefined precision (0) is returned, scale can also be uncertain with some database engines."
+                    + " 'Default Decimal Scale' is used when writing those undefined numbers."
+                    + " If a value has more decimals than specified scale, then the value will be rounded-up,"
+                    + " e.g. 1.53 becomes 2 with scale 0, and 1.5 with scale 1.")
+            .defaultValue(String.valueOf(DEFAULT_SCALE_VALUE))
+            .addValidator(StandardValidators.NON_NEGATIVE_INTEGER_VALIDATOR)
+            .expressionLanguageSupported(true)
+            .required(true)
+            .build();
+
 
     public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, boolean convertNames) throws SQLException, IOException {
         return convertToAvroStream(rs, outStream, null, null, convertNames);
@@ -90,7 +165,95 @@ public class JdbcCommon {
 
     public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, String recordName, ResultSetRowCallback callback, final int maxRows, boolean convertNames)
             throws SQLException, IOException {
-        final Schema schema = createSchema(rs, recordName, convertNames);
+        final AvroConversionOptions options = AvroConversionOptions.builder()
+                .recordName(recordName)
+                .maxRows(maxRows)
+                .convertNames(convertNames)
+                .useLogicalTypes(false).build();
+        return convertToAvroStream(rs, outStream, options, callback);
+    }
+
+    public static void createEmptyAvroStream(final OutputStream outStream) throws IOException {
+        final FieldAssembler<Schema> builder = SchemaBuilder.record("NiFi_ExecuteSQL_Record").namespace("any.data").fields();
+        final Schema schema = builder.endRecord();
+
+        final DatumWriter<GenericRecord> datumWriter = new GenericDatumWriter<>(schema);
+        try (final DataFileWriter<GenericRecord> dataFileWriter = new DataFileWriter<>(datumWriter)) {
+            dataFileWriter.create(schema, outStream);
+        }
+    }
+
+    public static class AvroConversionOptions {
+        private final String recordName;
+        private final int maxRows;
+        private final boolean convertNames;
+        private final boolean useLogicalTypes;
+        private final int defaultPrecision;
+        private final int defaultScale;
+
+        private AvroConversionOptions(String recordName, int maxRows, boolean convertNames, boolean useLogicalTypes, int defaultPrecision, int defaultScale) {
+            this.recordName = recordName;
+            this.maxRows = maxRows;
+            this.convertNames = convertNames;
+            this.useLogicalTypes = useLogicalTypes;
+            this.defaultPrecision = defaultPrecision;
+            this.defaultScale = defaultScale;
+        }
+
+        public static Builder builder() {
+            return new Builder();
+        }
+
+        public static class Builder {
+            private String recordName;
+            private int maxRows = 0;
+            private boolean convertNames = false;
+            private boolean useLogicalTypes = false;
+            private int defaultPrecision = DEFAULT_PRECISION_VALUE;
+            private int defaultScale = DEFAULT_SCALE_VALUE;
+
+            /**
+             * Specify a priori record name to use if it cannot be determined from the result set.
+             */
+            public Builder recordName(String recordName) {
+                this.recordName = recordName;
+                return this;
+            }
+
+            public Builder maxRows(int maxRows) {
+                this.maxRows = maxRows;
+                return this;
+            }
+
+            public Builder convertNames(boolean convertNames) {
+                this.convertNames = convertNames;
+                return this;
+            }
+
+            public Builder useLogicalTypes(boolean useLogicalTypes) {
+                this.useLogicalTypes = useLogicalTypes;
+                return this;
+            }
+
+            public Builder defaultPrecision(int defaultPrecision) {
+                this.defaultPrecision = defaultPrecision;
+                return this;
+            }
+
+            public Builder defaultScale(int defaultScale) {
+                this.defaultScale = defaultScale;
+                return this;
+            }
+
+            public AvroConversionOptions build() {
+                return new AvroConversionOptions(recordName, maxRows, convertNames, useLogicalTypes, defaultPrecision, defaultScale);
+            }
+        }
+    }
+
+    public static long convertToAvroStream(final ResultSet rs, final OutputStream outStream, final AvroConversionOptions options, final ResultSetRowCallback callback)
+            throws SQLException, IOException {
+        final Schema schema = createSchema(rs, options);
         final GenericRecord rec = new GenericData.Record(schema);
 
         final DatumWriter<GenericRecord> datumWriter = new GenericDatumWriter<>(schema);
@@ -106,6 +269,7 @@ public class JdbcCommon {
                 }
                 for (int i = 1; i <= nrOfColumns; i++) {
                     final int javaSqlType = meta.getColumnType(i);
+                    final Schema fieldSchema = schema.getFields().get(i - 1).schema();
 
                     // Need to handle CLOB and BLOB before getObject() is called, due to ResultSet's maximum portability statement
                     if (javaSqlType == CLOB) {
@@ -122,6 +286,22 @@ public class JdbcCommon {
                             }
                             rec.put(i - 1, new String(buffer));
                             clob.free();
+                        } else {
+                            rec.put(i - 1, null);
+                        }
+                        continue;
+                    }
+
+                    if (javaSqlType == NCLOB) {
+                        NClob nClob = rs.getNClob(i);
+                        if (nClob != null) {
+                            final Reader characterStream = nClob.getCharacterStream();
+                            long numChars = (int) nClob.length();
+                            final CharBuffer buffer = CharBuffer.allocate((int) numChars);
+                            characterStream.read(buffer);
+                            buffer.flip();
+                            rec.put(i - 1, buffer.toString());
+                            nClob.free();
                         } else {
                             rec.put(i - 1, null);
                         }
@@ -171,8 +351,13 @@ public class JdbcCommon {
                         //MS SQL returns TINYINT as a Java Short, which Avro doesn't understand.
                         rec.put(i - 1, ((Short) value).intValue());
                     } else if (value instanceof BigDecimal) {
-                        // Avro can't handle BigDecimal as a number - it will throw an AvroRuntimeException such as: "Unknown datum type: java.math.BigDecimal: 38"
-                        rec.put(i - 1, value.toString());
+                        if (options.useLogicalTypes) {
+                            // Delegate mapping to AvroTypeUtil in order to utilize logical types.
+                            rec.put(i - 1, AvroTypeUtil.convertToAvroObject(value, fieldSchema));
+                        } else {
+                            // As string for backward compatibility.
+                            rec.put(i - 1, value.toString());
+                        }
 
                     } else if (value instanceof BigInteger) {
                         // Check the precision of the BIGINT. Some databases allow arbitrary precision (> 19), but Avro won't handle that.
@@ -208,6 +393,15 @@ public class JdbcCommon {
                             rec.put(i - 1, value);
                         }
 
+                    } else if (value instanceof Date) {
+                        if (options.useLogicalTypes) {
+                            // Delegate mapping to AvroTypeUtil in order to utilize logical types.
+                            rec.put(i - 1, AvroTypeUtil.convertToAvroObject(value, fieldSchema));
+                        } else {
+                            // As string for backward compatibility.
+                            rec.put(i - 1, value.toString());
+                        }
+
                     } else {
                         // The different types that we support are numbers (int, long, double, float),
                         // as well as boolean values and Strings. Since Avro doesn't provide
@@ -219,7 +413,7 @@ public class JdbcCommon {
                 dataFileWriter.append(rec);
                 nrOfRows += 1;
 
-                if (maxRows > 0 && nrOfRows == maxRows)
+                if (options.maxRows > 0 && nrOfRows == options.maxRows)
                     break;
             }
 
@@ -231,19 +425,33 @@ public class JdbcCommon {
         return createSchema(rs, null, false);
     }
 
+    public static Schema createSchema(final ResultSet rs, String recordName, boolean convertNames) throws SQLException {
+        final AvroConversionOptions options = AvroConversionOptions.builder().recordName(recordName).convertNames(convertNames).build();
+        return createSchema(rs, options);
+    }
+
+    private static void addNullableField(
+            FieldAssembler<Schema> builder,
+            String columnName,
+            Function<BaseTypeBuilder<UnionAccumulator<NullDefault<Schema>>>, UnionAccumulator<NullDefault<Schema>>> func
+    ) {
+        final BaseTypeBuilder<UnionAccumulator<NullDefault<Schema>>> and = builder.name(columnName).type().unionOf().nullBuilder().endNull().and();
+        func.apply(and).endUnion().noDefault();
+    }
+
     /**
      * Creates an Avro schema from a result set. If the table/record name is known a priori and provided, use that as a
      * fallback for the record name if it cannot be retrieved from the result set, and finally fall back to a default value.
      *
-     * @param rs         The result set to convert to Avro
-     * @param recordName The a priori record name to use if it cannot be determined from the result set.
+     * @param rs The result set to convert to Avro
+     * @param options Specify various options
      * @return A Schema object representing the result set converted to an Avro record
      * @throws SQLException if any error occurs during conversion
      */
-    public static Schema createSchema(final ResultSet rs, String recordName, boolean convertNames) throws SQLException {
+    public static Schema createSchema(final ResultSet rs, AvroConversionOptions options) throws SQLException {
         final ResultSetMetaData meta = rs.getMetaData();
         final int nrOfColumns = meta.getColumnCount();
-        String tableName = StringUtils.isEmpty(recordName) ? "NiFi_ExecuteSQL_Record" : recordName;
+        String tableName = StringUtils.isEmpty(options.recordName) ? "NiFi_ExecuteSQL_Record" : options.recordName;
         if (nrOfColumns > 0) {
             String tableNameFromMeta = meta.getTableName(1);
             if (!StringUtils.isBlank(tableNameFromMeta)) {
@@ -251,7 +459,7 @@ public class JdbcCommon {
             }
         }
 
-        if (convertNames) {
+        if (options.convertNames) {
             tableName = normalizeNameForAvro(tableName);
         }
 
@@ -267,7 +475,7 @@ public class JdbcCommon {
         *  check for alias. Postgres is the one that has the null column names for calculated fields.
         */
             String nameOrLabel = StringUtils.isNotEmpty(meta.getColumnLabel(i)) ? meta.getColumnLabel(i) :meta.getColumnName(i);
-            String columnName = convertNames ? normalizeNameForAvro(nameOrLabel) : nameOrLabel;
+            String columnName = options.convertNames ? normalizeNameForAvro(nameOrLabel) : nameOrLabel;
             switch (meta.getColumnType(i)) {
                 case CHAR:
                 case LONGNVARCHAR:
@@ -276,6 +484,7 @@ public class JdbcCommon {
                 case NVARCHAR:
                 case VARCHAR:
                 case CLOB:
+                case NCLOB:
                     builder.name(columnName).type().unionOf().nullBuilder().endNull().and().stringType().endUnion().noDefault();
                     break;
 
@@ -285,7 +494,7 @@ public class JdbcCommon {
                     break;
 
                 case INTEGER:
-                    if (meta.isSigned(i) || (meta.getPrecision(i) > 0 && meta.getPrecision(i) <= MAX_DIGITS_IN_INT)) {
+                    if (meta.isSigned(i) || (meta.getPrecision(i) > 0 && meta.getPrecision(i) < MAX_DIGITS_IN_INT)) {
                         builder.name(columnName).type().unionOf().nullBuilder().endNull().and().intType().endUnion().noDefault();
                     } else {
                         builder.name(columnName).type().unionOf().nullBuilder().endNull().and().longType().endUnion().noDefault();
@@ -324,17 +533,53 @@ public class JdbcCommon {
                     builder.name(columnName).type().unionOf().nullBuilder().endNull().and().doubleType().endUnion().noDefault();
                     break;
 
-                // Did not find direct suitable type, need to be clarified!!!!
+                // Since Avro 1.8, LogicalType is supported.
                 case DECIMAL:
                 case NUMERIC:
-                    builder.name(columnName).type().unionOf().nullBuilder().endNull().and().stringType().endUnion().noDefault();
+                    if (options.useLogicalTypes) {
+                        final int decimalPrecision;
+                        final int decimalScale;
+                        if (meta.getPrecision(i) > 0) {
+                            // When database returns a certain precision, we can rely on that.
+                            decimalPrecision = meta.getPrecision(i);
+                            decimalScale = meta.getScale(i);
+                        } else {
+                            // If not, use default precision.
+                            decimalPrecision = options.defaultPrecision;
+                            // Oracle returns precision=0, scale=-127 for variable scale value such as ROWNUM or function result.
+                            // Specifying 'oracle.jdbc.J2EE13Compliant' SystemProperty makes it to return scale=0 instead.
+                            // Queries for example, 'SELECT 1.23 as v from DUAL' can be problematic because it can't be mapped with decimal with scale=0.
+                            // Default scale is used to preserve decimals in such case.
+                            decimalScale = meta.getScale(i) > 0 ? meta.getScale(i) : options.defaultScale;
+                        }
+                        final LogicalTypes.Decimal decimal = LogicalTypes.decimal(decimalPrecision, decimalScale);
+                        addNullableField(builder, columnName,
+                                u -> u.type(decimal.addToSchema(SchemaBuilder.builder().bytesType())));
+                    } else {
+                        addNullableField(builder, columnName, u -> u.stringType());
+                    }
                     break;
 
-                // Did not find direct suitable type, need to be clarified!!!!
                 case DATE:
+
+                    addNullableField(builder, columnName,
+                            u -> options.useLogicalTypes
+                                    ? u.type(LogicalTypes.date().addToSchema(SchemaBuilder.builder().intType()))
+                                    : u.stringType());
+                    break;
+
                 case TIME:
+                    addNullableField(builder, columnName,
+                            u -> options.useLogicalTypes
+                                    ? u.type(LogicalTypes.timeMillis().addToSchema(SchemaBuilder.builder().intType()))
+                                    : u.stringType());
+                    break;
+
                 case TIMESTAMP:
-                    builder.name(columnName).type().unionOf().nullBuilder().endNull().and().stringType().endUnion().noDefault();
+                    addNullableField(builder, columnName,
+                            u -> options.useLogicalTypes
+                                    ? u.type(LogicalTypes.timestampMillis().addToSchema(SchemaBuilder.builder().longType()))
+                                    : u.stringType());
                     break;
 
                 case BINARY:
@@ -347,7 +592,8 @@ public class JdbcCommon {
 
 
                 default:
-                    throw new IllegalArgumentException("createSchema: Unknown SQL type " + meta.getColumnType(i) + " cannot be converted to Avro type");
+                    throw new IllegalArgumentException("createSchema: Unknown SQL type " + meta.getColumnType(i) + " / " + meta.getColumnTypeName(i)
+                            + " (table: " + tableName + ", column: " + columnName + ") cannot be converted to Avro type");
             }
         }
 
@@ -370,4 +616,5 @@ public class JdbcCommon {
     public interface ResultSetRowCallback {
         void processRow(ResultSet resultSet) throws IOException;
     }
+
 }

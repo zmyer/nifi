@@ -29,7 +29,10 @@ import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.resource.ResourceFactory;
 import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.authorization.user.NiFiUserUtils;
+import org.apache.nifi.bundle.Bundle;
+import org.apache.nifi.bundle.BundleCoordinate;
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
+import org.apache.nifi.components.ConfigurableComponent;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.connectable.Connection;
@@ -43,14 +46,13 @@ import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.ReportingTaskNode;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.Template;
-import org.apache.nifi.controller.exception.ProcessorInstantiationException;
 import org.apache.nifi.controller.label.Label;
 import org.apache.nifi.controller.queue.FlowFileQueue;
 import org.apache.nifi.controller.queue.QueueSize;
-import org.apache.nifi.controller.reporting.ReportingTaskInstantiationException;
 import org.apache.nifi.controller.repository.ContentNotFoundException;
 import org.apache.nifi.controller.repository.claim.ContentDirection;
 import org.apache.nifi.controller.service.ControllerServiceNode;
+import org.apache.nifi.controller.service.ControllerServiceProvider;
 import org.apache.nifi.controller.status.ConnectionStatus;
 import org.apache.nifi.controller.status.PortStatus;
 import org.apache.nifi.controller.status.ProcessGroupStatus;
@@ -78,7 +80,10 @@ import org.apache.nifi.provenance.search.QuerySubmission;
 import org.apache.nifi.provenance.search.SearchTerm;
 import org.apache.nifi.provenance.search.SearchTerms;
 import org.apache.nifi.provenance.search.SearchableField;
+import org.apache.nifi.registry.ComponentVariableRegistry;
+import org.apache.nifi.registry.VariableDescriptor;
 import org.apache.nifi.registry.VariableRegistry;
+import org.apache.nifi.registry.flow.VersionedProcessGroup;
 import org.apache.nifi.remote.RemoteGroupPort;
 import org.apache.nifi.remote.RootGroupPort;
 import org.apache.nifi.reporting.ReportingTask;
@@ -88,11 +93,13 @@ import org.apache.nifi.search.SearchContext;
 import org.apache.nifi.search.SearchResult;
 import org.apache.nifi.search.Searchable;
 import org.apache.nifi.services.FlowService;
+import org.apache.nifi.util.BundleUtils;
 import org.apache.nifi.util.FormatUtils;
 import org.apache.nifi.util.NiFiProperties;
 import org.apache.nifi.web.DownloadableContent;
 import org.apache.nifi.web.NiFiCoreException;
 import org.apache.nifi.web.ResourceNotFoundException;
+import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.DocumentedTypeDTO;
 import org.apache.nifi.web.api.dto.DtoFactory;
 import org.apache.nifi.web.api.dto.provenance.AttributeDTO;
@@ -130,7 +137,6 @@ import java.util.Set;
 import java.util.SortedSet;
 import java.util.TimeZone;
 import java.util.TreeSet;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -167,6 +173,10 @@ public class ControllerFacade implements Authorizable {
         }
     }
 
+    public ControllerServiceProvider getControllerServiceProvider() {
+        return flowController;
+    }
+
     /**
      * Sets the name of this controller.
      *
@@ -196,35 +206,21 @@ public class ControllerFacade implements Authorizable {
     }
 
     /**
-     * Create a temporary Processor used for extracting PropertyDescriptor's for ControllerService reference authorization.
+     * Gets the cached temporary instance of the component for the given type and bundle.
      *
-     * @param type type of processor
-     * @return processor
-     * @throws ProcessorInstantiationException when unable to instantiate the processor
+     * @param type type of the component
+     * @param bundle the bundle of the component
+     * @return the temporary component
+     * @throws IllegalStateException if no temporary component exists for the given type and bundle
      */
-    public ProcessorNode createTemporaryProcessor(String type) throws ProcessorInstantiationException {
-        return flowController.createProcessor(type, UUID.randomUUID().toString(), false);
-    }
+    public ConfigurableComponent getTemporaryComponent(final String type, final BundleDTO bundle) {
+        final ConfigurableComponent configurableComponent = ExtensionManager.getTempComponent(type, BundleUtils.getBundle(type, bundle));
 
-    /**
-     * Create a temporary ReportingTask used for extracting PropertyDescriptor's for ControllerService reference authorization.
-     *
-     * @param type type of reporting task
-     * @return reporting task
-     * @throws ReportingTaskInstantiationException when unable to instantiate the reporting task
-     */
-    public ReportingTaskNode createTemporaryReportingTask(String type) throws ReportingTaskInstantiationException {
-        return flowController.createReportingTask(type, UUID.randomUUID().toString(), false, false);
-    }
+        if (configurableComponent == null) {
+            throw new IllegalStateException("Unable to obtain temporary component for " + type);
+        }
 
-    /**
-     * Create a temporary ControllerService used for extracting PropertyDescriptor's for ControllerService reference authorization.
-     *
-     * @param type type of controller service
-     * @return controller service
-     */
-    public ControllerServiceNode createTemporaryControllerService(String type) {
-        return flowController.createControllerService(type, UUID.randomUUID().toString(), false);
+        return configurableComponent;
     }
 
     /**
@@ -301,10 +297,12 @@ public class ControllerFacade implements Authorizable {
             throw new ResourceNotFoundException(String.format("Unable to locate processor with id '%s'.", processorId));
         }
 
-        final StatusHistoryDTO statusHistory = flowController.getProcessorStatusHistory(processorId);
+        final boolean authorized = processor.isAuthorized(authorizer, RequestAction.READ, NiFiUserUtils.getNiFiUser());
+
+        final StatusHistoryDTO statusHistory = flowController.getProcessorStatusHistory(processorId, authorized);
 
         // if not authorized
-        if (!processor.isAuthorized(authorizer, RequestAction.READ, NiFiUserUtils.getNiFiUser())) {
+        if (!authorized) {
             statusHistory.getComponentDetails().put(ComponentStatusRepository.COMPONENT_DETAIL_NAME, processorId);
             statusHistory.getComponentDetails().put(ComponentStatusRepository.COMPONENT_DETAIL_TYPE, "Processor");
         }
@@ -450,10 +448,13 @@ public class ControllerFacade implements Authorizable {
     /**
      * Gets the FlowFileProcessor types that this controller supports.
      *
+     * @param bundleGroupFilter if specified, must be member of bundle group
+     * @param bundleArtifactFilter if specified, must be member of bundle artifact
+     * @param typeFilter if specified, type must match
      * @return types
      */
-    public Set<DocumentedTypeDTO> getFlowFileProcessorTypes() {
-        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(Processor.class));
+    public Set<DocumentedTypeDTO> getFlowFileProcessorTypes(final String bundleGroupFilter, final String bundleArtifactFilter, final String typeFilter) {
+        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(Processor.class), bundleGroupFilter, bundleArtifactFilter, typeFilter);
     }
 
     /**
@@ -462,7 +463,7 @@ public class ControllerFacade implements Authorizable {
      * @return the FlowFileComparator types that this controller supports
      */
     public Set<DocumentedTypeDTO> getFlowFileComparatorTypes() {
-        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(FlowFilePrioritizer.class));
+        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(FlowFilePrioritizer.class), null, null, null);
     }
 
     /**
@@ -472,10 +473,10 @@ public class ControllerFacade implements Authorizable {
      * @param type type
      * @return whether the specified type implements the specified serviceType
      */
-    private boolean implementsServiceType(final String serviceType, final Class type) {
+    private boolean implementsServiceType(final Class serviceType, final Class type) {
         final List<Class<?>> interfaces = ClassUtils.getAllInterfaces(type);
         for (final Class i : interfaces) {
-            if (ControllerService.class.isAssignableFrom(i) && i.getName().equals(serviceType)) {
+            if (ControllerService.class.isAssignableFrom(i) && serviceType.isAssignableFrom(i)) {
                 return true;
             }
         }
@@ -487,36 +488,62 @@ public class ControllerFacade implements Authorizable {
      * Gets the ControllerService types that this controller supports.
      *
      * @param serviceType type
+     * @param serviceBundleGroup if serviceType specified, the bundle group of the serviceType
+     * @param serviceBundleArtifact if serviceType specified, the bundle artifact of the serviceType
+     * @param serviceBundleVersion if serviceType specified, the bundle version of the serviceType
+     * @param bundleGroupFilter if specified, must be member of bundle group
+     * @param bundleArtifactFilter if specified, must be member of bundle artifact
+     * @param typeFilter if specified, type must match
      * @return the ControllerService types that this controller supports
      */
-    public Set<DocumentedTypeDTO> getControllerServiceTypes(final String serviceType) {
+    public Set<DocumentedTypeDTO> getControllerServiceTypes(final String serviceType, final String serviceBundleGroup, final String serviceBundleArtifact, final String serviceBundleVersion,
+                                                            final String bundleGroupFilter, final String bundleArtifactFilter, final String typeFilter) {
+
         final Set<Class> serviceImplementations = ExtensionManager.getExtensions(ControllerService.class);
 
         // identify the controller services that implement the specified serviceType if applicable
-        final Set<Class> matchingServiceImplementions;
         if (serviceType != null) {
-            matchingServiceImplementions = new HashSet<>();
+            final BundleCoordinate bundleCoordinate = new BundleCoordinate(serviceBundleGroup, serviceBundleArtifact, serviceBundleVersion);
+            final Bundle csBundle = ExtensionManager.getBundle(bundleCoordinate);
+            if (csBundle == null) {
+                throw new IllegalStateException("Unable to find bundle for coordinate " + bundleCoordinate.getCoordinate());
+            }
+
+            Class serviceClass = null;
+            final ClassLoader currentContextClassLoader = Thread.currentThread().getContextClassLoader();
+            try {
+                Thread.currentThread().setContextClassLoader(csBundle.getClassLoader());
+                serviceClass = Class.forName(serviceType, false, csBundle.getClassLoader());
+            } catch (final Exception e) {
+                Thread.currentThread().setContextClassLoader(currentContextClassLoader);
+                throw new IllegalArgumentException(String.format("Unable to load %s from bundle %s: %s", serviceType, bundleCoordinate, e), e);
+            }
+
+            final Map<Class, Bundle> matchingServiceImplementations = new HashMap<>();
 
             // check each type and remove those that aren't in the specified ancestry
-            for (final Class type : serviceImplementations) {
-                if (implementsServiceType(serviceType, type)) {
-                    matchingServiceImplementions.add(type);
+            for (final Class csClass : serviceImplementations) {
+                if (implementsServiceType(serviceClass, csClass)) {
+                    matchingServiceImplementations.put(csClass, ExtensionManager.getBundle(csClass.getClassLoader()));
                 }
             }
-        } else {
-            matchingServiceImplementions = serviceImplementations;
-        }
 
-        return dtoFactory.fromDocumentedTypes(matchingServiceImplementions);
+            return dtoFactory.fromDocumentedTypes(matchingServiceImplementations, bundleGroupFilter, bundleArtifactFilter, typeFilter);
+        } else {
+            return dtoFactory.fromDocumentedTypes(serviceImplementations, bundleGroupFilter, bundleArtifactFilter, typeFilter);
+        }
     }
 
     /**
      * Gets the ReportingTask types that this controller supports.
      *
+     * @param bundleGroupFilter if specified, must be member of bundle group
+     * @param bundleArtifactFilter if specified, must be member of bundle artifact
+     * @param typeFilter if specified, type must match
      * @return the ReportingTask types that this controller supports
      */
-    public Set<DocumentedTypeDTO> getReportingTaskTypes() {
-        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(ReportingTask.class));
+    public Set<DocumentedTypeDTO> getReportingTaskTypes(final String bundleGroupFilter, final String bundleArtifactFilter, final String typeFilter) {
+        return dtoFactory.fromDocumentedTypes(ExtensionManager.getExtensions(ReportingTask.class), bundleGroupFilter, bundleArtifactFilter, typeFilter);
     }
 
     /**
@@ -566,6 +593,11 @@ public class ControllerFacade implements Authorizable {
         controllerStatus.setDisabledCount(counts.getDisabledCount());
         controllerStatus.setActiveRemotePortCount(counts.getActiveRemotePortCount());
         controllerStatus.setInactiveRemotePortCount(counts.getInactiveRemotePortCount());
+        controllerStatus.setUpToDateCount(counts.getUpToDateCount());
+        controllerStatus.setLocallyModifiedCount(counts.getLocallyModifiedCount());
+        controllerStatus.setStaleCount(counts.getStaleCount());
+        controllerStatus.setLocallyModifiedAndStaleCount(counts.getLocallyModifiedAndStaleCount());
+        controllerStatus.setSyncFailureCount(counts.getSyncFailureCount());
 
         return controllerStatus;
     }
@@ -901,6 +933,12 @@ public class ControllerFacade implements Authorizable {
         final List<ProvenanceSearchableFieldDTO> searchableFieldNames = new ArrayList<>();
         final List<SearchableField> fields = provenanceRepository.getSearchableFields();
         for (final SearchableField field : fields) {
+            // we exclude the Event Time because it is always searchable but don't want support querying it this way...
+            // we prefer the user queries using startDate and endDate
+            if (SearchableFields.EventTime.equals(field)) {
+                continue;
+            }
+
             final ProvenanceSearchableFieldDTO searchableField = new ProvenanceSearchableFieldDTO();
             searchableField.setId(field.getIdentifier());
             searchableField.setField(field.getSearchableFieldName());
@@ -972,7 +1010,7 @@ public class ControllerFacade implements Authorizable {
         final QuerySubmission querySubmission = provenanceRepository.submitQuery(query, NiFiUserUtils.getNiFiUser());
 
         // return the query with the results populated at this point
-        return getProvenanceQuery(querySubmission.getQueryIdentifier());
+        return getProvenanceQuery(querySubmission.getQueryIdentifier(), requestDto.getSummarize(), requestDto.getIncrementalResults());
     }
 
     /**
@@ -981,7 +1019,7 @@ public class ControllerFacade implements Authorizable {
      * @param provenanceId id
      * @return the results of a provenance query
      */
-    public ProvenanceDTO getProvenanceQuery(String provenanceId) {
+    public ProvenanceDTO getProvenanceQuery(String provenanceId, Boolean summarize, Boolean incrementalResults) {
         try {
             // get the query to the provenance repository
             final ProvenanceRepository provenanceRepository = flowController.getProvenanceRepository();
@@ -1027,11 +1065,14 @@ public class ControllerFacade implements Authorizable {
             provenanceDto.setPercentCompleted(queryResult.getPercentComplete());
 
             // convert each event
-            final List<ProvenanceEventDTO> events = new ArrayList<>();
-            for (final ProvenanceEventRecord record : queryResult.getMatchingEvents()) {
-                events.add(createProvenanceEventDto(record));
+            final boolean includeResults = incrementalResults == null || Boolean.TRUE.equals(incrementalResults);
+            if (includeResults || queryResult.isFinished()) {
+                final List<ProvenanceEventDTO> events = new ArrayList<>();
+                for (final ProvenanceEventRecord record : queryResult.getMatchingEvents()) {
+                    events.add(createProvenanceEventDto(record, Boolean.TRUE.equals(summarize)));
+                }
+                resultsDto.setProvenanceEvents(events);
             }
-            resultsDto.setProvenanceEvents(events);
 
             if (requestDto.getMaxResults() != null && queryResult.getTotalHitCount() >= requestDto.getMaxResults()) {
                 resultsDto.setTotalCount(requestDto.getMaxResults().longValue());
@@ -1079,12 +1120,12 @@ public class ControllerFacade implements Authorizable {
         final ProvenanceRepository provenanceRepository = flowController.getProvenanceRepository();
         final ComputeLineageSubmission result;
 
-        // submit the event
         if (LineageRequestType.FLOWFILE.equals(requestDto.getLineageRequestType())) {
-            // submit uuid
-            if (requestDto.getEventId() == null) {
+            if (requestDto.getUuid() != null) {
+                // submit uuid if it is specified
                 result = provenanceRepository.submitLineageComputation(requestDto.getUuid(), NiFiUserUtils.getNiFiUser());
             } else {
+                // submit the event if the flowfile uuid needs to be looked up
                 result = provenanceRepository.submitLineageComputation(requestDto.getEventId(), NiFiUserUtils.getNiFiUser());
             }
         } else {
@@ -1227,7 +1268,7 @@ public class ControllerFacade implements Authorizable {
             final ProvenanceEventRecord event = flowController.replayFlowFile(originalEvent, user);
 
             // convert the event record
-            return createProvenanceEventDto(event);
+            return createProvenanceEventDto(event, false);
         } catch (final IOException ioe) {
             throw new NiFiCoreException("An error occurred while getting the specified event.", ioe);
         }
@@ -1241,7 +1282,7 @@ public class ControllerFacade implements Authorizable {
     private AuthorizationResult checkAuthorizationForReplay(final ProvenanceEventRecord event) {
         // if the connection id isn't specified, then the replay wouldn't be available anyways and we have nothing to authorize against so deny it`
         if (event.getSourceQueueIdentifier() == null) {
-            return AuthorizationResult.denied();
+            return AuthorizationResult.denied("The connection id in the provenance event is unknown.");
         }
 
         final NiFiUser user = NiFiUserUtils.getNiFiUser();
@@ -1272,7 +1313,7 @@ public class ControllerFacade implements Authorizable {
     private void authorizeReplay(final ProvenanceEventRecord event) {
         // if the connection id isn't specified, then the replay wouldn't be available anyways and we have nothing to authorize against so deny it`
         if (event.getSourceQueueIdentifier() == null) {
-            throw new AccessDeniedException("The connection id is unknown.");
+            throw new AccessDeniedException("The connection id in the provenance event is unknown.");
         }
 
         final NiFiUser user = NiFiUserUtils.getNiFiUser();
@@ -1313,7 +1354,7 @@ public class ControllerFacade implements Authorizable {
             dataAuthorizable.authorize(authorizer, RequestAction.READ, NiFiUserUtils.getNiFiUser(), attributes);
 
             // convert the event
-            return createProvenanceEventDto(event);
+            return createProvenanceEventDto(event, false);
         } catch (final IOException ioe) {
             throw new NiFiCoreException("An error occurred while getting the specified event.", ioe);
         }
@@ -1325,116 +1366,120 @@ public class ControllerFacade implements Authorizable {
      * @param event event
      * @return event
      */
-    private ProvenanceEventDTO createProvenanceEventDto(final ProvenanceEventRecord event) {
-        // convert the attributes
-        final Comparator<AttributeDTO> attributeComparator = new Comparator<AttributeDTO>() {
-            @Override
-            public int compare(AttributeDTO a1, AttributeDTO a2) {
-                return Collator.getInstance(Locale.US).compare(a1.getName(), a2.getName());
-            }
-        };
-
-        final SortedSet<AttributeDTO> attributes = new TreeSet<>(attributeComparator);
-
-        final Map<String, String> updatedAttrs = event.getUpdatedAttributes();
-        final Map<String, String> previousAttrs = event.getPreviousAttributes();
-
-        // add previous attributes that haven't been modified.
-        for (final Map.Entry<String, String> entry : previousAttrs.entrySet()) {
-            // don't add any attributes that have been updated; we will do that next
-            if (updatedAttrs.containsKey(entry.getKey())) {
-                continue;
-            }
-
-            final AttributeDTO attribute = new AttributeDTO();
-            attribute.setName(entry.getKey());
-            attribute.setValue(entry.getValue());
-            attribute.setPreviousValue(entry.getValue());
-            attributes.add(attribute);
-        }
-
-        // Add all of the update attributes
-        for (final Map.Entry<String, String> entry : updatedAttrs.entrySet()) {
-            final AttributeDTO attribute = new AttributeDTO();
-            attribute.setName(entry.getKey());
-            attribute.setValue(entry.getValue());
-            attribute.setPreviousValue(previousAttrs.get(entry.getKey()));
-            attributes.add(attribute);
-        }
-
-        // build the event dto
+    private ProvenanceEventDTO createProvenanceEventDto(final ProvenanceEventRecord event, final boolean summarize) {
         final ProvenanceEventDTO dto = new ProvenanceEventDTO();
         dto.setId(String.valueOf(event.getEventId()));
-        dto.setAlternateIdentifierUri(event.getAlternateIdentifierUri());
-        dto.setAttributes(attributes);
-        dto.setTransitUri(event.getTransitUri());
         dto.setEventId(event.getEventId());
         dto.setEventTime(new Date(event.getEventTime()));
         dto.setEventType(event.getEventType().name());
+        dto.setFlowFileUuid(event.getFlowFileUuid());
         dto.setFileSize(FormatUtils.formatDataSize(event.getFileSize()));
         dto.setFileSizeBytes(event.getFileSize());
         dto.setComponentId(event.getComponentId());
         dto.setComponentType(event.getComponentType());
-        dto.setSourceSystemFlowFileId(event.getSourceSystemFlowFileIdentifier());
-        dto.setFlowFileUuid(event.getFlowFileUuid());
-        dto.setRelationship(event.getRelationship());
-        dto.setDetails(event.getDetails());
-
-        final ContentAvailability contentAvailability = flowController.getContentAvailability(event);
-
-        // content
-        dto.setContentEqual(contentAvailability.isContentSame());
-        dto.setInputContentAvailable(contentAvailability.isInputAvailable());
-        dto.setInputContentClaimSection(event.getPreviousContentClaimSection());
-        dto.setInputContentClaimContainer(event.getPreviousContentClaimContainer());
-        dto.setInputContentClaimIdentifier(event.getPreviousContentClaimIdentifier());
-        dto.setInputContentClaimOffset(event.getPreviousContentClaimOffset());
-        dto.setInputContentClaimFileSizeBytes(event.getPreviousFileSize());
-        dto.setOutputContentAvailable(contentAvailability.isOutputAvailable());
-        dto.setOutputContentClaimSection(event.getContentClaimSection());
-        dto.setOutputContentClaimContainer(event.getContentClaimContainer());
-        dto.setOutputContentClaimIdentifier(event.getContentClaimIdentifier());
-        dto.setOutputContentClaimOffset(event.getContentClaimOffset());
-        dto.setOutputContentClaimFileSize(FormatUtils.formatDataSize(event.getFileSize()));
-        dto.setOutputContentClaimFileSizeBytes(event.getFileSize());
-
-        // format the previous file sizes if possible
-        if (event.getPreviousFileSize() != null) {
-            dto.setInputContentClaimFileSize(FormatUtils.formatDataSize(event.getPreviousFileSize()));
-        }
-
-        // determine if authorized for event replay
-        final AuthorizationResult replayAuthorized = checkAuthorizationForReplay(event);
-
-        // replay
-        dto.setReplayAvailable(contentAvailability.isReplayable() && Result.Approved.equals(replayAuthorized.getResult()));
-        dto.setReplayExplanation(contentAvailability.isReplayable()
-                && !Result.Approved.equals(replayAuthorized.getResult()) ? replayAuthorized.getExplanation() : contentAvailability.getReasonNotReplayable());
-        dto.setSourceConnectionIdentifier(event.getSourceQueueIdentifier());
 
         // sets the component details if it can find the component still in the flow
         setComponentDetails(dto);
 
-        // event duration
-        if (event.getEventDuration() >= 0) {
-            dto.setEventDuration(event.getEventDuration());
+        // only include all details if not summarizing
+        if (!summarize) {
+            // convert the attributes
+            final Comparator<AttributeDTO> attributeComparator = new Comparator<AttributeDTO>() {
+                @Override
+                public int compare(AttributeDTO a1, AttributeDTO a2) {
+                    return Collator.getInstance(Locale.US).compare(a1.getName(), a2.getName());
+                }
+            };
+
+            final SortedSet<AttributeDTO> attributes = new TreeSet<>(attributeComparator);
+
+            final Map<String, String> updatedAttrs = event.getUpdatedAttributes();
+            final Map<String, String> previousAttrs = event.getPreviousAttributes();
+
+            // add previous attributes that haven't been modified.
+            for (final Map.Entry<String, String> entry : previousAttrs.entrySet()) {
+                // don't add any attributes that have been updated; we will do that next
+                if (updatedAttrs.containsKey(entry.getKey())) {
+                    continue;
+                }
+
+                final AttributeDTO attribute = new AttributeDTO();
+                attribute.setName(entry.getKey());
+                attribute.setValue(entry.getValue());
+                attribute.setPreviousValue(entry.getValue());
+                attributes.add(attribute);
+            }
+
+            // Add all of the update attributes
+            for (final Map.Entry<String, String> entry : updatedAttrs.entrySet()) {
+                final AttributeDTO attribute = new AttributeDTO();
+                attribute.setName(entry.getKey());
+                attribute.setValue(entry.getValue());
+                attribute.setPreviousValue(previousAttrs.get(entry.getKey()));
+                attributes.add(attribute);
+            }
+
+            // additional event details
+            dto.setAlternateIdentifierUri(event.getAlternateIdentifierUri());
+            dto.setAttributes(attributes);
+            dto.setTransitUri(event.getTransitUri());
+            dto.setSourceSystemFlowFileId(event.getSourceSystemFlowFileIdentifier());
+            dto.setRelationship(event.getRelationship());
+            dto.setDetails(event.getDetails());
+
+            final ContentAvailability contentAvailability = flowController.getContentAvailability(event);
+
+            // content
+            dto.setContentEqual(contentAvailability.isContentSame());
+            dto.setInputContentAvailable(contentAvailability.isInputAvailable());
+            dto.setInputContentClaimSection(event.getPreviousContentClaimSection());
+            dto.setInputContentClaimContainer(event.getPreviousContentClaimContainer());
+            dto.setInputContentClaimIdentifier(event.getPreviousContentClaimIdentifier());
+            dto.setInputContentClaimOffset(event.getPreviousContentClaimOffset());
+            dto.setInputContentClaimFileSizeBytes(event.getPreviousFileSize());
+            dto.setOutputContentAvailable(contentAvailability.isOutputAvailable());
+            dto.setOutputContentClaimSection(event.getContentClaimSection());
+            dto.setOutputContentClaimContainer(event.getContentClaimContainer());
+            dto.setOutputContentClaimIdentifier(event.getContentClaimIdentifier());
+            dto.setOutputContentClaimOffset(event.getContentClaimOffset());
+            dto.setOutputContentClaimFileSize(FormatUtils.formatDataSize(event.getFileSize()));
+            dto.setOutputContentClaimFileSizeBytes(event.getFileSize());
+
+            // format the previous file sizes if possible
+            if (event.getPreviousFileSize() != null) {
+                dto.setInputContentClaimFileSize(FormatUtils.formatDataSize(event.getPreviousFileSize()));
+            }
+
+            // determine if authorized for event replay
+            final AuthorizationResult replayAuthorized = checkAuthorizationForReplay(event);
+
+            // replay
+            dto.setReplayAvailable(contentAvailability.isReplayable() && Result.Approved.equals(replayAuthorized.getResult()));
+            dto.setReplayExplanation(contentAvailability.isReplayable()
+                    && !Result.Approved.equals(replayAuthorized.getResult()) ? replayAuthorized.getExplanation() : contentAvailability.getReasonNotReplayable());
+            dto.setSourceConnectionIdentifier(event.getSourceQueueIdentifier());
+
+            // event duration
+            if (event.getEventDuration() >= 0) {
+                dto.setEventDuration(event.getEventDuration());
+            }
+
+            // lineage duration
+            if (event.getLineageStartDate() > 0) {
+                final long lineageDuration = event.getEventTime() - event.getLineageStartDate();
+                dto.setLineageDuration(lineageDuration);
+            }
+
+            // parent uuids
+            final List<String> parentUuids = new ArrayList<>(event.getParentUuids());
+            Collections.sort(parentUuids, Collator.getInstance(Locale.US));
+            dto.setParentUuids(parentUuids);
+
+            // child uuids
+            final List<String> childUuids = new ArrayList<>(event.getChildUuids());
+            Collections.sort(childUuids, Collator.getInstance(Locale.US));
+            dto.setChildUuids(childUuids);
         }
-
-        // lineage duration
-        if (event.getLineageStartDate() > 0) {
-            final long lineageDuration = event.getEventTime() - event.getLineageStartDate();
-            dto.setLineageDuration(lineageDuration);
-        }
-
-        // parent uuids
-        final List<String> parentUuids = new ArrayList<>(event.getParentUuids());
-        Collections.sort(parentUuids, Collator.getInstance(Locale.US));
-        dto.setParentUuids(parentUuids);
-
-        // child uuids
-        final List<String> childUuids = new ArrayList<>(event.getChildUuids());
-        Collections.sort(childUuids, Collator.getInstance(Locale.US));
-        dto.setChildUuids(childUuids);
 
         return dto;
     }
@@ -1565,6 +1610,7 @@ public class ControllerFacade implements Authorizable {
         final List<String> matches = new ArrayList<>();
 
         addIfAppropriate(searchStr, port.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, port.getVersionedComponentId().orElse(null), "Version Control ID", matches);
         addIfAppropriate(searchStr, port.getName(), "Name", matches);
         addIfAppropriate(searchStr, port.getComments(), "Comments", matches);
 
@@ -1608,6 +1654,9 @@ public class ControllerFacade implements Authorizable {
         return dto;
     }
 
+    public void verifyComponentTypes(VersionedProcessGroup versionedFlow) {
+        flowController.verifyComponentTypesInSnippet(versionedFlow);
+    }
 
 
     private ComponentSearchResultDTO search(final String searchStr, final ProcessorNode procNode) {
@@ -1615,6 +1664,7 @@ public class ControllerFacade implements Authorizable {
         final Processor processor = procNode.getProcessor();
 
         addIfAppropriate(searchStr, procNode.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, procNode.getVersionedComponentId().orElse(null), "Version Control ID", matches);
         addIfAppropriate(searchStr, procNode.getName(), "Name", matches);
         addIfAppropriate(searchStr, procNode.getComments(), "Comments", matches);
 
@@ -1719,8 +1769,19 @@ public class ControllerFacade implements Authorizable {
         }
 
         addIfAppropriate(searchStr, group.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, group.getVersionedComponentId().orElse(null), "Version Control ID", matches);
         addIfAppropriate(searchStr, group.getName(), "Name", matches);
         addIfAppropriate(searchStr, group.getComments(), "Comments", matches);
+
+        final ComponentVariableRegistry varRegistry = group.getVariableRegistry();
+        if (varRegistry != null) {
+            final Map<VariableDescriptor, String> variableMap = varRegistry.getVariableMap();
+            for (final Map.Entry<VariableDescriptor, String> entry : variableMap.entrySet()) {
+                addIfAppropriate(searchStr, entry.getKey().getName(), "Variable Name", matches);
+                addIfAppropriate(searchStr, entry.getValue(), "Variable Value", matches);
+            }
+        }
+
 
         if (matches.isEmpty()) {
             return null;
@@ -1739,6 +1800,7 @@ public class ControllerFacade implements Authorizable {
 
         // search id and name
         addIfAppropriate(searchStr, connection.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, connection.getVersionedComponentId().orElse(null), "Version Control ID", matches);
         addIfAppropriate(searchStr, connection.getName(), "Name", matches);
 
         // search relationships
@@ -1820,6 +1882,7 @@ public class ControllerFacade implements Authorizable {
     private ComponentSearchResultDTO search(final String searchStr, final RemoteProcessGroup group) {
         final List<String> matches = new ArrayList<>();
         addIfAppropriate(searchStr, group.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, group.getVersionedComponentId().orElse(null), "Version Control ID", matches);
         addIfAppropriate(searchStr, group.getName(), "Name", matches);
         addIfAppropriate(searchStr, group.getComments(), "Comments", matches);
         addIfAppropriate(searchStr, group.getTargetUris(), "URLs", matches);
@@ -1845,6 +1908,7 @@ public class ControllerFacade implements Authorizable {
     private ComponentSearchResultDTO search(final String searchStr, final Funnel funnel) {
         final List<String> matches = new ArrayList<>();
         addIfAppropriate(searchStr, funnel.getIdentifier(), "Id", matches);
+        addIfAppropriate(searchStr, funnel.getVersionedComponentId().orElse(null), "Version Control ID", matches);
 
         if (matches.isEmpty()) {
             return null;

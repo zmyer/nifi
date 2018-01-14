@@ -56,12 +56,14 @@ public class SFTPTransfer implements FileTransfer {
         .description("The fully qualified path to the Private Key file")
         .required(false)
         .addValidator(StandardValidators.FILE_EXISTS_VALIDATOR)
+        .expressionLanguageSupported(true)
         .build();
     public static final PropertyDescriptor PRIVATE_KEY_PASSPHRASE = new PropertyDescriptor.Builder()
         .name("Private Key Passphrase")
         .description("Password for the private key")
         .required(false)
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(true)
         .sensitive(true)
         .build();
     public static final PropertyDescriptor HOST_KEY_FILE = new PropertyDescriptor.Builder()
@@ -81,6 +83,7 @@ public class SFTPTransfer implements FileTransfer {
         .name("Port")
         .description("The port that the remote system is listening on for file transfers")
         .addValidator(StandardValidators.PORT_VALIDATOR)
+        .expressionLanguageSupported(true)
         .required(true)
         .defaultValue("22")
         .build();
@@ -93,17 +96,22 @@ public class SFTPTransfer implements FileTransfer {
         .build();
 
     /**
-     * Dynamic property which is used to decide if the {@link #ensureDirectoryExists(FlowFile, File)} method should perform a {@link ChannelSftp#ls(String)} before calling
+     * Property which is used to decide if the {@link #ensureDirectoryExists(FlowFile, File)} method should perform a {@link ChannelSftp#ls(String)} before calling
      * {@link ChannelSftp#mkdir(String)}. In most cases, the code should call ls before mkdir, but some weird permission setups (chmod 100) on a directory would cause the 'ls' to throw a permission
      * exception.
-     * <p>
-     * This property is dynamic until deemed a worthy inclusion as proper.
      */
     public static final PropertyDescriptor DISABLE_DIRECTORY_LISTING = new PropertyDescriptor.Builder()
         .name("Disable Directory Listing")
-        .description("Disables directory listings before operations which might fail, such as configurations which create directory structures.")
+        .description("If set to 'true', directory listing is not performed prior to create missing directories." +
+                " By default, this processor executes a directory listing command" +
+                " to see target directory existence before creating missing directories." +
+                " However, there are situations that you might need to disable the directory listing such as followings." +
+                " Directory listing might fail with some permission setups (e.g. chmod 100) on a directory." +
+                " Also, if any other SFTP client created the directory after this processor performed a listing" +
+                " and before a directory creation request by this processor is finished," +
+                " then an error is returned because the directory already exists.")
         .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
-        .dynamic(true)
+        .allowableValues("true", "false")
         .defaultValue("false")
         .build();
 
@@ -251,7 +259,7 @@ public class SFTPTransfer implements FileTransfer {
             try {
                 getListing(newFullForwardPath, depth + 1, maxResults, listing);
             } catch (final IOException e) {
-                logger.error("Unable to get listing from " + newFullForwardPath + "; skipping this subdirectory");
+                logger.error("Unable to get listing from " + newFullForwardPath + "; skipping this subdirectory", e);
             }
         }
     }
@@ -308,7 +316,12 @@ public class SFTPTransfer implements FileTransfer {
     }
 
     @Override
-    public void deleteFile(final String path, final String remoteFileName) throws IOException {
+    public boolean flush(final FlowFile flowFile) throws IOException {
+        return true;
+    }
+
+    @Override
+    public void deleteFile(final FlowFile flowFile, final String path, final String remoteFileName) throws IOException {
         final String fullPath = (path == null) ? remoteFileName : (path.endsWith("/")) ? path + remoteFileName : path + "/" + remoteFileName;
         try {
             sftp.rm(fullPath);
@@ -325,7 +338,7 @@ public class SFTPTransfer implements FileTransfer {
     }
 
     @Override
-    public void deleteDirectory(final String remoteDirectoryName) throws IOException {
+    public void deleteDirectory(final FlowFile flowFile, final String remoteDirectoryName) throws IOException {
         try {
             sftp.rm(remoteDirectoryName);
         } catch (final SftpException e) {
@@ -395,7 +408,8 @@ public class SFTPTransfer implements FileTransfer {
 
         final JSch jsch = new JSch();
         try {
-            final Session session = jsch.getSession(ctx.getProperty(USERNAME).evaluateAttributeExpressions(flowFile).getValue(),
+            final String username = ctx.getProperty(USERNAME).evaluateAttributeExpressions(flowFile).getValue();
+            final Session session = jsch.getSession(username,
                 ctx.getProperty(HOSTNAME).evaluateAttributeExpressions(flowFile).getValue(),
                 ctx.getProperty(PORT).evaluateAttributeExpressions(flowFile).asInteger().intValue());
 
@@ -429,21 +443,28 @@ public class SFTPTransfer implements FileTransfer {
                 session.setPassword(password);
             }
 
-            session.setTimeout(ctx.getProperty(FileTransfer.CONNECTION_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue());
+            final int connectionTimeoutMillis = ctx.getProperty(FileTransfer.CONNECTION_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue();
+            session.setTimeout(connectionTimeoutMillis);
             session.connect();
             this.session = session;
             this.closed = false;
 
             sftp = (ChannelSftp) session.openChannel("sftp");
-            sftp.connect();
+            sftp.connect(connectionTimeoutMillis);
             session.setTimeout(ctx.getProperty(FileTransfer.DATA_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue());
             if (!ctx.getProperty(USE_KEEPALIVE_ON_TIMEOUT).asBoolean()) {
                 session.setServerAliveCountMax(0); // do not send keepalive message on SocketTimeoutException
             }
-            this.homeDir = sftp.getHome();
+            try {
+                this.homeDir = sftp.getHome();
+            } catch (SftpException e) {
+                // For some combination of server configuration and user home directory, getHome() can fail with "2: File not found"
+                // Since  homeDir is only used tor SEND provenance event transit uri, this is harmless. Log and continue.
+                logger.debug("Failed to retrieve {} home directory due to {}", new Object[]{username, e.getMessage()});
+            }
             return sftp;
 
-        } catch (final SftpException | JSchException e) {
+        } catch (JSchException e) {
             throw new IOException("Failed to obtain connection to remote host due to " + e.toString(), e);
         }
     }
@@ -604,8 +625,8 @@ public class SFTPTransfer implements FileTransfer {
     }
 
     @Override
-    public void rename(final String source, final String target) throws IOException {
-        final ChannelSftp sftp = getChannel(null);
+    public void rename(final FlowFile flowFile, final String source, final String target) throws IOException {
+        final ChannelSftp sftp = getChannel(flowFile);
         try {
             sftp.rename(source, target);
         } catch (final SftpException e) {

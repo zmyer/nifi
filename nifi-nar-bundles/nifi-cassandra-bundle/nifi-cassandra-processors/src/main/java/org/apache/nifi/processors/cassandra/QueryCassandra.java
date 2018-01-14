@@ -33,6 +33,7 @@ import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.DatumWriter;
+import org.apache.commons.lang3.StringEscapeUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.annotation.behavior.EventDriven;
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -40,6 +41,7 @@ import org.apache.nifi.annotation.lifecycle.OnShutdown;
 import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
 import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
@@ -103,6 +105,7 @@ public class QueryCassandra extends AbstractCassandraProcessor {
                     + "Time Unit, such as: nanos, millis, secs, mins, hrs, days. A value of zero means there is no limit. ")
             .defaultValue("0 seconds")
             .required(true)
+            .expressionLanguageSupported(true)
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
             .build();
 
@@ -112,6 +115,7 @@ public class QueryCassandra extends AbstractCassandraProcessor {
                     + "and means there is no limit.")
             .defaultValue("0")
             .required(true)
+            .expressionLanguageSupported(true)
             .addValidator(StandardValidators.INTEGER_VALIDATOR)
             .build();
 
@@ -178,7 +182,7 @@ public class QueryCassandra extends AbstractCassandraProcessor {
         ComponentLog log = getLogger();
         try {
             connectToCassandra(context);
-            final int fetchSize = context.getProperty(FETCH_SIZE).asInteger();
+            final int fetchSize = context.getProperty(FETCH_SIZE).evaluateAttributeExpressions().asInteger();
             if (fetchSize > 0) {
                 synchronized (cluster.get()) {
                     cluster.get().getConfiguration().getQueryOptions().setFetchSize(fetchSize);
@@ -214,9 +218,9 @@ public class QueryCassandra extends AbstractCassandraProcessor {
 
         final ComponentLog logger = getLogger();
         final String selectQuery = context.getProperty(CQL_SELECT_QUERY).evaluateAttributeExpressions(fileToProcess).getValue();
-        final long queryTimeout = context.getProperty(QUERY_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS);
+        final long queryTimeout = context.getProperty(QUERY_TIMEOUT).evaluateAttributeExpressions(fileToProcess).asTimePeriod(TimeUnit.MILLISECONDS);
         final String outputFormat = context.getProperty(OUTPUT_FORMAT).getValue();
-        final Charset charset = Charset.forName(context.getProperty(CHARSET).getValue());
+        final Charset charset = Charset.forName(context.getProperty(CHARSET).evaluateAttributeExpressions(fileToProcess).getValue());
         final StopWatch stopWatch = new StopWatch(true);
 
         if (fileToProcess == null) {
@@ -260,6 +264,10 @@ public class QueryCassandra extends AbstractCassandraProcessor {
 
             // set attribute how many rows were selected
             fileToProcess = session.putAttribute(fileToProcess, RESULT_ROW_COUNT, String.valueOf(nrOfRows.get()));
+
+            // set mime.type based on output format
+            fileToProcess = session.putAttribute(fileToProcess, CoreAttributes.MIME_TYPE.key(),
+                    JSON_FORMAT.equals(outputFormat) ? "application/json" : "application/avro-binary");
 
             logger.info("{} contains {} Avro records; transferring to 'success'",
                     new Object[]{fileToProcess, nrOfRows.get()});
@@ -490,6 +498,8 @@ public class QueryCassandra extends AbstractCassandraProcessor {
             SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ssZ");
             dateFormat.setTimeZone(TimeZone.getTimeZone("UTC"));
             return "\"" + dateFormat.format((Date) value) + "\"";
+        } else if (value instanceof String) {
+            return "\"" + StringEscapeUtils.escapeJson((String) value) + "\"";
         } else {
             return "\"" + value.toString() + "\"";
         }
@@ -508,7 +518,7 @@ public class QueryCassandra extends AbstractCassandraProcessor {
         final int nrOfColumns = (columnDefinitions == null ? 0 : columnDefinitions.size());
         String tableName = "NiFi_Cassandra_Query_Record";
         if (nrOfColumns > 0) {
-            String tableNameFromMeta = columnDefinitions.getTable(1);
+            String tableNameFromMeta = columnDefinitions.getTable(0);
             if (!StringUtils.isBlank(tableNameFromMeta)) {
                 tableName = tableNameFromMeta;
             }

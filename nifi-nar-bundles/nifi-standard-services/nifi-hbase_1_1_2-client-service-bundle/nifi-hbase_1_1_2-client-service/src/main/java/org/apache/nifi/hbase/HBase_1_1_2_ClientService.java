@@ -26,6 +26,7 @@ import org.apache.hadoop.hbase.client.Admin;
 import org.apache.hadoop.hbase.client.Connection;
 import org.apache.hadoop.hbase.client.ConnectionFactory;
 import org.apache.hadoop.hbase.client.Put;
+import org.apache.hadoop.hbase.client.Delete;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
@@ -47,7 +48,6 @@ import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.controller.ControllerServiceInitializationContext;
 import org.apache.nifi.hadoop.KerberosProperties;
-import org.apache.nifi.hadoop.KerberosTicketRenewer;
 import org.apache.nifi.hadoop.SecurityUtil;
 import org.apache.nifi.hbase.put.PutColumn;
 import org.apache.nifi.hbase.put.PutFlowFile;
@@ -56,6 +56,8 @@ import org.apache.nifi.hbase.scan.ResultCell;
 import org.apache.nifi.hbase.scan.ResultHandler;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.reporting.InitializationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
@@ -80,16 +82,15 @@ import java.util.concurrent.atomic.AtomicReference;
         description="These properties will be set on the HBase configuration after loading any provided configuration files.")
 public class HBase_1_1_2_ClientService extends AbstractControllerService implements HBaseClientService {
 
+    private static final Logger logger = LoggerFactory.getLogger(HBase_1_1_2_ClientService.class);
+
     static final String HBASE_CONF_ZK_QUORUM = "hbase.zookeeper.quorum";
     static final String HBASE_CONF_ZK_PORT = "hbase.zookeeper.property.clientPort";
     static final String HBASE_CONF_ZNODE_PARENT = "zookeeper.znode.parent";
     static final String HBASE_CONF_CLIENT_RETRIES = "hbase.client.retries.number";
 
-    static final long TICKET_RENEWAL_PERIOD = 60000;
-
     private volatile Connection connection;
     private volatile UserGroupInformation ugi;
-    private volatile KerberosTicketRenewer renewer;
 
     private List<PropertyDescriptor> properties;
     private KerberosProperties kerberosProperties;
@@ -97,6 +98,10 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
 
     // Holder of cached Configuration information so validation does not reload the same config over and over
     private final AtomicReference<ValidationResources> validationResourceHolder = new AtomicReference<>();
+
+    protected Connection getConnection() {
+        return connection;
+    }
 
     @Override
     protected void init(ControllerServiceInitializationContext config) throws InitializationException {
@@ -112,7 +117,12 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
         props.add(ZOOKEEPER_ZNODE_PARENT);
         props.add(HBASE_CLIENT_RETRIES);
         props.add(PHOENIX_CLIENT_JAR_LOCATION);
+        props.addAll(getAdditionalProperties());
         this.properties = Collections.unmodifiableList(props);
+    }
+
+    protected List<PropertyDescriptor> getAdditionalProperties() {
+        return new ArrayList<>();
     }
 
     protected KerberosProperties getKerberosProperties(File kerberosConfigFile) {
@@ -166,8 +176,8 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
             }
 
             final Configuration hbaseConfig = resources.getConfiguration();
-            final String principal = validationContext.getProperty(kerberosProperties.getKerberosPrincipal()).getValue();
-            final String keytab = validationContext.getProperty(kerberosProperties.getKerberosKeytab()).getValue();
+            final String principal = validationContext.getProperty(kerberosProperties.getKerberosPrincipal()).evaluateAttributeExpressions().getValue();
+            final String keytab = validationContext.getProperty(kerberosProperties.getKerberosKeytab()).evaluateAttributeExpressions().getValue();
 
             problems.addAll(KerberosProperties.validatePrincipalAndKeytab(
                     this.getClass().getSimpleName(), hbaseConfig, principal, keytab, getLogger()));
@@ -176,6 +186,23 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
         return problems;
     }
 
+    /**
+     * As of Apache NiFi 1.5.0, due to changes made to
+     * {@link SecurityUtil#loginKerberos(Configuration, String, String)}, which is used by this
+     * class to authenticate a principal with Kerberos, HBase controller services no longer
+     * attempt relogins explicitly.  For more information, please read the documentation for
+     * {@link SecurityUtil#loginKerberos(Configuration, String, String)}.
+     * <p/>
+     * In previous versions of NiFi, a {@link org.apache.nifi.hadoop.KerberosTicketRenewer} was started
+     * when the HBase controller service was enabled.  The use of a separate thread to explicitly relogin could cause
+     * race conditions with the implicit relogin attempts made by hadoop/HBase code on a thread that references the same
+     * {@link UserGroupInformation} instance.  One of these threads could leave the
+     * {@link javax.security.auth.Subject} in {@link UserGroupInformation} to be cleared or in an unexpected state
+     * while the other thread is attempting to use the {@link javax.security.auth.Subject}, resulting in failed
+     * authentication attempts that would leave the HBase controller service in an unrecoverable state.
+     *
+     * @see SecurityUtil#loginKerberos(Configuration, String, String)
+     */
     @OnEnabled
     public void onEnabled(final ConfigurationContext context) throws InitializationException, IOException, InterruptedException {
         this.connection = createConnection(context);
@@ -185,12 +212,6 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
             final Admin admin = this.connection.getAdmin();
             if (admin != null) {
                 admin.listTableNames();
-            }
-
-            // if we got here then we have a successful connection, so if we have a ugi then start a renewer
-            if (ugi != null) {
-                final String id = getClass().getSimpleName();
-                renewer = SecurityUtil.startTicketRenewalThread(id, ugi, TICKET_RENEWAL_PERIOD, getLogger());
             }
         }
     }
@@ -222,8 +243,8 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
         }
 
         if (SecurityUtil.isSecurityEnabled(hbaseConfig)) {
-            final String principal = context.getProperty(kerberosProperties.getKerberosPrincipal()).getValue();
-            final String keyTab = context.getProperty(kerberosProperties.getKerberosKeytab()).getValue();
+            final String principal = context.getProperty(kerberosProperties.getKerberosPrincipal()).evaluateAttributeExpressions().getValue();
+            final String keyTab = context.getProperty(kerberosProperties.getKerberosKeytab()).evaluateAttributeExpressions().getValue();
 
             getLogger().info("HBase Security Enabled, logging in as principal {} with keytab {}", new Object[] {principal, keyTab});
             ugi = SecurityUtil.loginKerberos(hbaseConfig, principal, keyTab);
@@ -255,10 +276,6 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
 
     @OnDisabled
     public void shutdown() {
-        if (renewer != null) {
-            renewer.stop();
-        }
-
         if (connection != null) {
             try {
                 connection.close();
@@ -283,10 +300,18 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
                 }
 
                 for (final PutColumn column : putFlowFile.getColumns()) {
-                    put.addColumn(
-                            column.getColumnFamily(),
-                            column.getColumnQualifier(),
-                            column.getBuffer());
+                    if (column.getTimestamp() != null) {
+                        put.addColumn(
+                                column.getColumnFamily(),
+                                column.getColumnQualifier(),
+                                column.getTimestamp(),
+                                column.getBuffer());
+                    } else {
+                        put.addColumn(
+                                column.getColumnFamily(),
+                                column.getColumnQualifier(),
+                                column.getBuffer());
+                    }
                 }
             }
 
@@ -305,6 +330,26 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
                         column.getBuffer());
             }
             table.put(put);
+        }
+    }
+
+    @Override
+    public boolean checkAndPut(final String tableName, final byte[] rowId, final byte[] family, final byte[] qualifier, final byte[] value, final PutColumn column) throws IOException {
+        try (final Table table = connection.getTable(TableName.valueOf(tableName))) {
+            Put put = new Put(rowId);
+            put.addColumn(
+                column.getColumnFamily(),
+                column.getColumnQualifier(),
+                column.getBuffer());
+            return table.checkAndPut(rowId, family, qualifier, value, put);
+        }
+    }
+
+    @Override
+    public void delete(final String tableName, final byte[] rowId) throws IOException {
+        try (final Table table = connection.getTable(TableName.valueOf(tableName))) {
+            Delete delete = new Delete(rowId);
+            table.delete(delete);
         }
     }
 
@@ -331,35 +376,9 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
 
                 // convert HBase cells to NiFi cells
                 final ResultCell[] resultCells = new ResultCell[cells.length];
-
                 for (int i=0; i < cells.length; i++) {
                     final Cell cell = cells[i];
-
-                    final ResultCell resultCell = new ResultCell();
-                    resultCell.setRowArray(cell.getRowArray());
-                    resultCell.setRowOffset(cell.getRowOffset());
-                    resultCell.setRowLength(cell.getRowLength());
-
-                    resultCell.setFamilyArray(cell.getFamilyArray());
-                    resultCell.setFamilyOffset(cell.getFamilyOffset());
-                    resultCell.setFamilyLength(cell.getFamilyLength());
-
-                    resultCell.setQualifierArray(cell.getQualifierArray());
-                    resultCell.setQualifierOffset(cell.getQualifierOffset());
-                    resultCell.setQualifierLength(cell.getQualifierLength());
-
-                    resultCell.setTimestamp(cell.getTimestamp());
-                    resultCell.setTypeByte(cell.getTypeByte());
-                    resultCell.setSequenceId(cell.getSequenceId());
-
-                    resultCell.setValueArray(cell.getValueArray());
-                    resultCell.setValueOffset(cell.getValueOffset());
-                    resultCell.setValueLength(cell.getValueLength());
-
-                    resultCell.setTagsArray(cell.getTagsArray());
-                    resultCell.setTagsOffset(cell.getTagsOffset());
-                    resultCell.setTagsLength(cell.getTagsLength());
-
+                    final ResultCell resultCell = getResultCell(cell);
                     resultCells[i] = resultCell;
                 }
 
@@ -367,6 +386,54 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
                 handler.handle(rowKey, resultCells);
             }
         }
+    }
+
+    @Override
+    public void scan(final String tableName, final byte[] startRow, final byte[] endRow, final Collection<Column> columns, final ResultHandler handler)
+            throws IOException {
+
+        try (final Table table = connection.getTable(TableName.valueOf(tableName));
+             final ResultScanner scanner = getResults(table, startRow, endRow, columns)) {
+
+            for (final Result result : scanner) {
+                final byte[] rowKey = result.getRow();
+                final Cell[] cells = result.rawCells();
+
+                if (cells == null) {
+                    continue;
+                }
+
+                // convert HBase cells to NiFi cells
+                final ResultCell[] resultCells = new ResultCell[cells.length];
+                for (int i=0; i < cells.length; i++) {
+                    final Cell cell = cells[i];
+                    final ResultCell resultCell = getResultCell(cell);
+                    resultCells[i] = resultCell;
+                }
+
+                // delegate to the handler
+                handler.handle(rowKey, resultCells);
+            }
+        }
+    }
+
+    // protected and extracted into separate method for testing
+    protected ResultScanner getResults(final Table table, final byte[] startRow, final byte[] endRow, final Collection<Column> columns) throws IOException {
+        final Scan scan = new Scan();
+        scan.setStartRow(startRow);
+        scan.setStopRow(endRow);
+
+        if (columns != null) {
+            for (Column col : columns) {
+                if (col.getQualifier() == null) {
+                    scan.addFamily(col.getFamily());
+                } else {
+                    scan.addColumn(col.getFamily(), col.getQualifier());
+                }
+            }
+        }
+
+        return table.getScanner(scan);
     }
 
     // protected and extracted into separate method for testing
@@ -395,6 +462,34 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
         return table.getScanner(scan);
     }
 
+    private ResultCell getResultCell(Cell cell) {
+        final ResultCell resultCell = new ResultCell();
+        resultCell.setRowArray(cell.getRowArray());
+        resultCell.setRowOffset(cell.getRowOffset());
+        resultCell.setRowLength(cell.getRowLength());
+
+        resultCell.setFamilyArray(cell.getFamilyArray());
+        resultCell.setFamilyOffset(cell.getFamilyOffset());
+        resultCell.setFamilyLength(cell.getFamilyLength());
+
+        resultCell.setQualifierArray(cell.getQualifierArray());
+        resultCell.setQualifierOffset(cell.getQualifierOffset());
+        resultCell.setQualifierLength(cell.getQualifierLength());
+
+        resultCell.setTimestamp(cell.getTimestamp());
+        resultCell.setTypeByte(cell.getTypeByte());
+        resultCell.setSequenceId(cell.getSequenceId());
+
+        resultCell.setValueArray(cell.getValueArray());
+        resultCell.setValueOffset(cell.getValueOffset());
+        resultCell.setValueLength(cell.getValueLength());
+
+        resultCell.setTagsArray(cell.getTagsArray());
+        resultCell.setTagsOffset(cell.getTagsOffset());
+        resultCell.setTagsLength(cell.getTagsLength());
+        return resultCell;
+    }
+
     static protected class ValidationResources {
         private final String configResources;
         private final Configuration configuration;
@@ -419,6 +514,16 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
     }
 
     @Override
+    public byte[] toBytes(float f) {
+        return Bytes.toBytes(f);
+    }
+
+    @Override
+    public byte[] toBytes(int i) {
+        return Bytes.toBytes(i);
+    }
+
+    @Override
     public byte[] toBytes(long l) {
         return Bytes.toBytes(l);
     }
@@ -436,5 +541,19 @@ public class HBase_1_1_2_ClientService extends AbstractControllerService impleme
     @Override
     public byte[] toBytesBinary(String s) {
         return Bytes.toBytesBinary(s);
+    }
+
+    @Override
+    public String toTransitUri(String tableName, String rowKey) {
+        if (connection == null) {
+            logger.warn("Connection has not been established, could not create a transit URI. Returning null.");
+            return null;
+        }
+        try {
+            final String masterAddress = connection.getAdmin().getClusterStatus().getMaster().getHostAndPort();
+            return "hbase://" + masterAddress + "/" + tableName + (rowKey != null && !rowKey.isEmpty() ? "/" + rowKey : "");
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to get HBase Admin interface, due to " + e, e);
+        }
     }
 }

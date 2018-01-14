@@ -17,6 +17,8 @@
 package org.apache.nifi.reporting.ambari;
 
 import com.yammer.metrics.core.VirtualMachineMetrics;
+
+import org.apache.nifi.annotation.configuration.DefaultSchedule;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
@@ -28,7 +30,7 @@ import org.apache.nifi.reporting.AbstractReportingTask;
 import org.apache.nifi.reporting.ReportingContext;
 import org.apache.nifi.reporting.ambari.api.MetricsBuilder;
 import org.apache.nifi.reporting.ambari.metrics.MetricsService;
-
+import org.apache.nifi.scheduling.SchedulingStrategy;
 
 import javax.json.Json;
 import javax.json.JsonBuilderFactory;
@@ -51,6 +53,7 @@ import java.util.concurrent.TimeUnit;
         "works, this reporting task should be scheduled to run every 60 seconds. Each iteration it will send the metrics " +
         "from the previous iteration, and calculate the current metrics to be sent on next iteration. Scheduling this reporting " +
         "task at a frequency other than 60 seconds may produce unexpected results.")
+@DefaultSchedule(strategy = SchedulingStrategy.TIMER_DRIVEN, period = "1 min")
 public class AmbariReportingTask extends AbstractReportingTask {
 
     static final PropertyDescriptor METRICS_COLLECTOR_URL = new PropertyDescriptor.Builder()
@@ -80,6 +83,15 @@ public class AmbariReportingTask extends AbstractReportingTask {
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
+    static final PropertyDescriptor PROCESS_GROUP_ID = new PropertyDescriptor.Builder()
+            .name("Process Group ID")
+            .description("If specified, the reporting task will send metrics about this process group only. If"
+                    + " not, the root process group is used and global metrics are sent.")
+            .required(false)
+            .expressionLanguageSupported(true)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .build();
+
     private volatile Client client;
     private volatile JsonBuilderFactory factory;
     private volatile VirtualMachineMetrics virtualMachineMetrics;
@@ -93,6 +105,7 @@ public class AmbariReportingTask extends AbstractReportingTask {
         properties.add(METRICS_COLLECTOR_URL);
         properties.add(APPLICATION_ID);
         properties.add(HOSTNAME);
+        properties.add(PROCESS_GROUP_ID);
         return properties;
     }
 
@@ -112,12 +125,12 @@ public class AmbariReportingTask extends AbstractReportingTask {
 
     @Override
     public void onTrigger(final ReportingContext context) {
-        final String metricsCollectorUrl = context.getProperty(METRICS_COLLECTOR_URL)
-                .evaluateAttributeExpressions().getValue();
-        final String applicationId = context.getProperty(APPLICATION_ID)
-                .evaluateAttributeExpressions().getValue();
-        final String hostname = context.getProperty(HOSTNAME)
-                .evaluateAttributeExpressions().getValue();
+        final String metricsCollectorUrl = context.getProperty(METRICS_COLLECTOR_URL).evaluateAttributeExpressions().getValue();
+        final String applicationId = context.getProperty(APPLICATION_ID).evaluateAttributeExpressions().getValue();
+        final String hostname = context.getProperty(HOSTNAME).evaluateAttributeExpressions().getValue();
+
+        final boolean pgIdIsSet = context.getProperty(PROCESS_GROUP_ID).isSet();
+        final String processGroupId = pgIdIsSet ? context.getProperty(PROCESS_GROUP_ID).evaluateAttributeExpressions().getValue() : null;
 
         final long start = System.currentTimeMillis();
 
@@ -140,22 +153,28 @@ public class AmbariReportingTask extends AbstractReportingTask {
         }
 
         // calculate the current metrics, but store them to be sent next time
-        final ProcessGroupStatus status = context.getEventAccess().getControllerStatus();
-        final Map<String,String> statusMetrics = metricsService.getMetrics(status);
-        final Map<String,String> jvmMetrics = metricsService.getMetrics(virtualMachineMetrics);
+        final ProcessGroupStatus status = processGroupId == null ? context.getEventAccess().getControllerStatus() : context.getEventAccess().getGroupStatus(processGroupId);
 
-        final MetricsBuilder metricsBuilder = new MetricsBuilder(factory);
+        if(status != null) {
+            final Map<String,String> statusMetrics = metricsService.getMetrics(status, pgIdIsSet);
+            final Map<String,String> jvmMetrics = metricsService.getMetrics(virtualMachineMetrics);
 
-        final JsonObject metricsObject = metricsBuilder
-                .applicationId(applicationId)
-                .instanceId(status.getId())
-                .hostname(hostname)
-                .timestamp(start)
-                .addAllMetrics(statusMetrics)
-                .addAllMetrics(jvmMetrics)
-                .build();
+            final MetricsBuilder metricsBuilder = new MetricsBuilder(factory);
 
-        previousMetrics = metricsObject;
+            final JsonObject metricsObject = metricsBuilder
+                    .applicationId(applicationId)
+                    .instanceId(status.getId())
+                    .hostname(hostname)
+                    .timestamp(start)
+                    .addAllMetrics(statusMetrics)
+                    .addAllMetrics(jvmMetrics)
+                    .build();
+
+            previousMetrics = metricsObject;
+        } else {
+            getLogger().error("No process group status with ID = {}", new Object[]{processGroupId});
+            previousMetrics = null;
+        }
     }
 
 }

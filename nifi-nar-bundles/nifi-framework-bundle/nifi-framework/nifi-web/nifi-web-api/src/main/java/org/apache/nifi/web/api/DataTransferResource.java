@@ -16,12 +16,12 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.AccessDeniedException;
 import org.apache.nifi.authorization.AuthorizableLookup;
@@ -77,6 +77,8 @@ import javax.ws.rs.core.UriInfo;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 
 import static org.apache.commons.lang3.StringUtils.isEmpty;
 import static org.apache.nifi.remote.protocol.HandshakeProperty.BATCH_COUNT;
@@ -154,7 +156,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Create a transaction to the specified output port or input port",
             response = TransactionResultEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/{component-type}/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/{component-type}/{uuid}")
             }
     )
     @ApiResponses(
@@ -230,7 +232,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Transfer flow files to the input port",
             response = String.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -316,7 +318,14 @@ public class DataTransferResource extends ApplicationResource {
 
     private Peer constructPeer(final HttpServletRequest req, final InputStream inputStream,
                                final OutputStream outputStream, final String portId, final String transactionId) {
-        final String clientHostName = req.getRemoteHost();
+        String clientHostName = req.getRemoteHost();
+        try {
+            // req.getRemoteHost returns IP address, try to resolve hostname to be consistent with RAW protocol.
+            final InetAddress clientAddress = InetAddress.getByName(clientHostName);
+            clientHostName = clientAddress.getHostName();
+        } catch (UnknownHostException e) {
+            logger.info("Failed to resolve client hostname {}, due to {}", clientHostName, e.getMessage());
+        }
         final int clientPort = req.getRemotePort();
 
         final PeerDescription peerDescription = new PeerDescription(clientHostName, clientPort, req.isSecure());
@@ -373,7 +382,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Commit or cancel the specified transaction",
             response = TransactionResultEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -464,13 +473,13 @@ public class DataTransferResource extends ApplicationResource {
                 entity.setMessage(e.getMessage());
 
                 Response.ResponseBuilder builder = Response.status(Response.Status.BAD_REQUEST).entity(entity);
-                return clusterContext(noCache(builder)).build();
+                return noCache(builder).build();
             }
 
             return responseCreator.unexpectedErrorResponse(portId, transactionId, e);
         }
 
-        return clusterContext(noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager))).build();
+        return noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager)).build();
     }
 
 
@@ -482,7 +491,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Commit or cancel the specified transaction",
             response = TransactionResultEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -570,7 +579,7 @@ public class DataTransferResource extends ApplicationResource {
                     // it's not clear if there is an issue at server side, or cancel operation has been accomplished.
                     // Above conditions can guarantee this is the latter case, we return 200 OK here.
                     entity.setResponseCode(ResponseCode.CANCEL_TRANSACTION.getCode());
-                    return clusterContext(noCache(Response.ok(entity))).build();
+                    return noCache(Response.ok(entity)).build();
                 } else {
                     return responseCreator.unexpectedErrorResponse(portId, transactionId, e);
                 }
@@ -583,7 +592,7 @@ public class DataTransferResource extends ApplicationResource {
             return responseCreator.unexpectedErrorResponse(portId, transactionId, e);
         }
 
-        return clusterContext(noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager))).build();
+        return noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager)).build();
     }
 
     private Response cancelTransaction(String transactionId, TransactionResultEntity entity) {
@@ -602,7 +611,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Transfer flow files from the output port",
             response = StreamingOutput.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -688,7 +697,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Extend transaction TTL",
             response = TransactionResultEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/input-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -725,7 +734,7 @@ public class DataTransferResource extends ApplicationResource {
             value = "Extend transaction TTL",
             response = TransactionResultEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /data-transfer/output-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -789,7 +798,7 @@ public class DataTransferResource extends ApplicationResource {
             final TransactionResultEntity entity = new TransactionResultEntity();
             entity.setResponseCode(ResponseCode.CONTINUE_TRANSACTION.getCode());
             entity.setMessage("Extended TTL.");
-            return clusterContext(noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager))).build();
+            return noCache(setCommonHeaders(Response.ok(entity), transportProtocolVersion, transactionManager)).build();
 
         } catch (HandshakeException e) {
             return responseCreator.handshakeExceptionResponse(e);

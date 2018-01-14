@@ -16,6 +16,7 @@
  */
 package org.apache.nifi.controller.repository;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -33,10 +34,15 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.nifi.controller.repository.claim.ContentClaim;
@@ -44,10 +50,12 @@ import org.apache.nifi.controller.repository.claim.StandardContentClaim;
 import org.apache.nifi.controller.repository.claim.StandardResourceClaim;
 import org.apache.nifi.controller.repository.claim.StandardResourceClaimManager;
 import org.apache.nifi.controller.repository.util.DiskUtils;
+import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.stream.io.StreamUtils;
 import org.apache.nifi.util.NiFiProperties;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Ignore;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
 
@@ -55,8 +63,7 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import java.util.HashMap;
-import java.util.Map;
+import static org.junit.Assume.assumeFalse;
 
 public class TestFileSystemRepository {
 
@@ -85,6 +92,38 @@ public class TestFileSystemRepository {
     @After
     public void shutdown() throws IOException {
         repository.shutdown();
+    }
+
+    @Test
+    @Ignore("Intended for manual testing only, in order to judge changes to performance")
+    public void testWritePerformance() throws IOException {
+        final long bytesToWrite = 1_000_000_000L;
+        final int contentSize = 100;
+
+        final int iterations = (int) (bytesToWrite / contentSize);
+        final byte[] content = new byte[contentSize];
+        final Random random = new Random();
+        random.nextBytes(content);
+
+        //        final ContentClaimWriteCache cache = new ContentClaimWriteCache(repository);
+        final long start = System.nanoTime();
+        for (int i = 0; i < iterations; i++) {
+            final ContentClaim claim = repository.create(false);
+            try (final OutputStream out = repository.write(claim)) {
+                out.write(content);
+            }
+            //            final ContentClaim claim = cache.getContentClaim();
+            //            try (final OutputStream out = cache.write(claim)) {
+            //                out.write(content);
+            //            }
+        }
+        final long millis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+
+        final long mb = bytesToWrite / (1024 * 1024);
+        final long seconds = millis / 1000L;
+        final double mbps = (double) mb / (double) seconds;
+        System.out.println("Took " + millis + " millis to write " + contentSize + " bytes " + iterations + " times (total of "
+                + NumberFormat.getNumberInstance(Locale.US).format(bytesToWrite) + " bytes) for a write rate of " + mbps + " MB/s");
     }
 
     @Test
@@ -248,10 +287,12 @@ public class TestFileSystemRepository {
         repository.incrementClaimaintCount(claim);
 
         final Path claimPath = getPath(claim);
+        final String maxAppendableClaimLength = nifiProperties.getMaxAppendableClaimSize();
+        final int maxClaimLength = DataUnit.parseDataSize(maxAppendableClaimLength, DataUnit.B).intValue();
 
         // Create the file.
         try (final OutputStream out = repository.write(claim)) {
-            out.write(new byte[FileSystemRepository.MAX_APPENDABLE_CLAIM_LENGTH]);
+            out.write(new byte[maxClaimLength]);
         }
 
         int count = repository.decrementClaimantCount(claim);
@@ -401,6 +442,44 @@ public class TestFileSystemRepository {
     }
 
     @Test
+    public void testReadWithContentArchived() throws IOException {
+        assumeFalse(isWindowsEnvironment());//skip if on windows
+        final ContentClaim claim = repository.create(true);
+        final Path path = getPath(claim);
+        Files.deleteIfExists(path);
+
+        Path archivePath = FileSystemRepository.getArchivePath(path);
+
+        Files.createDirectories(archivePath.getParent());
+        final byte[] data = "The quick brown fox jumps over the lazy dog".getBytes();
+        try (final OutputStream out = Files.newOutputStream(archivePath, StandardOpenOption.WRITE, StandardOpenOption.CREATE)) {
+            out.write(data);
+        }
+
+        try (final InputStream inStream = repository.read(claim)) {
+            assertNotNull(inStream);
+            final byte[] dataRead = readFully(inStream, data.length);
+            assertArrayEquals(data, dataRead);
+        }
+    }
+
+    private boolean isWindowsEnvironment() {
+        return System.getProperty("os.name").toLowerCase().startsWith("windows");
+    }
+
+    @Test(expected = ContentNotFoundException.class)
+    public void testReadWithNoContentArchived() throws IOException {
+        assumeFalse(isWindowsEnvironment());//skip if on windows
+        final ContentClaim claim = repository.create(true);
+        final Path path = getPath(claim);
+        Files.deleteIfExists(path);
+
+        Path archivePath = FileSystemRepository.getArchivePath(path);
+        Files.deleteIfExists(archivePath);
+        repository.read(claim).close();
+    }
+
+    @Test
     public void testWrite() throws IOException {
         final ContentClaim claim = repository.create(true);
         final byte[] data = "The quick brown fox jumps over the lazy dog".getBytes();
@@ -419,7 +498,9 @@ public class TestFileSystemRepository {
 
         // write at least 1 MB to the output stream so that when we close the output stream
         // the repo won't keep the stream open.
-        final byte[] buff = new byte[FileSystemRepository.MAX_APPENDABLE_CLAIM_LENGTH];
+        final String maxAppendableClaimLength = nifiProperties.getMaxAppendableClaimSize();
+        final int maxClaimLength = DataUnit.parseDataSize(maxAppendableClaimLength, DataUnit.B).intValue();
+        final byte[] buff = new byte[maxClaimLength];
         out.write(buff);
         out.write(buff);
 

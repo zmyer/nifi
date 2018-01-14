@@ -16,14 +16,6 @@
  */
 package org.apache.nifi.processors.mongodb;
 
-import static com.google.common.base.Charsets.UTF_8;
-import static org.junit.Assert.assertEquals;
-
-import java.util.Collection;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.util.MockFlowFile;
@@ -37,48 +29,28 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
-import com.google.common.collect.Lists;
-import com.mongodb.MongoClient;
-import com.mongodb.MongoClientURI;
-import com.mongodb.client.MongoCollection;
+import java.nio.charset.StandardCharsets;
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+
+import static org.junit.Assert.assertEquals;
 
 @Ignore("Integration tests that cause failures in some environments. Require that they be run from Maven to run the embedded mongo maven plugin. Maven Plugin also fails in my CentOS 7 environment.")
-public class PutMongoTest {
-    private static final String MONGO_URI = "mongodb://localhost";
-    private static final String DATABASE_NAME = PutMongoTest.class.getSimpleName().toLowerCase();
-    private static final String COLLECTION_NAME = "test";
-
-    private static final List<Document> DOCUMENTS = Lists.newArrayList(
-        new Document("_id", "doc_1").append("a", 1).append("b", 2).append("c", 3),
-        new Document("_id", "doc_2").append("a", 1).append("b", 2).append("c", 4),
-        new Document("_id", "doc_3").append("a", 1).append("b", 3)
-        );
-
-    private TestRunner runner;
-    private MongoClient mongoClient;
-    private MongoCollection<Document> collection;
-
+public class PutMongoTest extends MongoWriteTestBase {
     @Before
     public void setup() {
-        runner = TestRunners.newTestRunner(PutMongo.class);
-        runner.setProperty(AbstractMongoProcessor.URI, MONGO_URI);
-        runner.setProperty(AbstractMongoProcessor.DATABASE_NAME, DATABASE_NAME);
-        runner.setProperty(AbstractMongoProcessor.COLLECTION_NAME, COLLECTION_NAME);
-
-        mongoClient = new MongoClient(new MongoClientURI(MONGO_URI));
-
-        collection = mongoClient.getDatabase(DATABASE_NAME).getCollection(COLLECTION_NAME);
+        super.setup(PutMongo.class);
     }
 
     @After
     public void teardown() {
-        runner = null;
-
-        mongoClient.getDatabase(DATABASE_NAME).drop();
+        super.teardown();
     }
 
     private byte[] documentToByteArray(Document doc) {
-        return doc.toJson().getBytes(UTF_8);
+        return doc.toJson().getBytes(StandardCharsets.UTF_8);
     }
 
     @Test
@@ -252,5 +224,36 @@ public class PutMongoTest {
 
         assertEquals(1, collection.count());
         assertEquals(doc, collection.find().first());
+    }
+
+    @Test
+    public void testUpsertWithOperators() throws Exception {
+        String upsert = "{\n" +
+                "  \"_id\": \"Test\",\n" +
+                "  \"$push\": {\n" +
+                "     \"testArr\": { \"msg\": \"Hi\" }\n" +
+                "  }\n" +
+                "}";
+        runner.setProperty(PutMongo.UPDATE_MODE, PutMongo.UPDATE_WITH_OPERATORS);
+        runner.setProperty(PutMongo.MODE, "update");
+        runner.setProperty(PutMongo.UPSERT, "true");
+        for (int x = 0; x < 3; x++) {
+            runner.enqueue(upsert.getBytes());
+        }
+        runner.run(3, true, true);
+        runner.assertTransferCount(PutMongo.REL_FAILURE, 0);
+        runner.assertTransferCount(PutMongo.REL_SUCCESS, 3);
+
+        Document query = new Document("_id", "Test");
+        Document result = collection.find(query).first();
+        List array = (List)result.get("testArr");
+        Assert.assertNotNull("Array was empty", array);
+        Assert.assertEquals("Wrong size", array.size(), 3);
+        for (int index = 0; index < array.size(); index++) {
+            Document doc = (Document)array.get(index);
+            String msg = doc.getString("msg");
+            Assert.assertNotNull("Msg was null", msg);
+            Assert.assertEquals("Msg had wrong value", msg, "Hi");
+        }
     }
 }

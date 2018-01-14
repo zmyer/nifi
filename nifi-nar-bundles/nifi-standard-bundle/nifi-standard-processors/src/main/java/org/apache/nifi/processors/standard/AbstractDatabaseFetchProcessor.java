@@ -16,14 +16,20 @@
  */
 package org.apache.nifi.processors.standard;
 
+import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.dbcp.DBCPService;
+import org.apache.nifi.expression.AttributeExpression;
+import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractSessionFactoryProcessor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.standard.db.DatabaseAdapter;
+import org.apache.nifi.util.StringUtils;
 
 import java.io.IOException;
 import java.math.BigDecimal;
@@ -36,6 +42,8 @@ import java.sql.Timestamp;
 import java.text.DecimalFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
@@ -76,6 +84,8 @@ import static java.sql.Types.VARCHAR;
  */
 public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFactoryProcessor {
 
+    public static final String INITIAL_MAX_VALUE_PROP_START = "initial.maxvalue.";
+
     // Relationships
     public static final Relationship REL_SUCCESS = new Relationship.Builder()
             .name("success")
@@ -97,15 +107,18 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
             .description("The name of the database table to be queried.")
             .required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor COLUMN_NAMES = new PropertyDescriptor.Builder()
             .name("Columns to Return")
             .description("A comma-separated list of column names to be used in the query. If your database requires "
                     + "special treatment of the names (quoting, e.g.), each name should include such treatment. If no "
-                    + "column names are supplied, all columns in the specified table will be returned.")
+                    + "column names are supplied, all columns in the specified table will be returned. NOTE: It is important "
+                    + "to use consistent column names for a given table for incremental fetch to work properly.")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor MAX_VALUE_COLUMN_NAMES = new PropertyDescriptor.Builder()
@@ -117,9 +130,11 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
                     + "can be used to retrieve only those rows that have been added/updated since the last retrieval. Note that some "
                     + "JDBC types such as bit/boolean are not conducive to maintaining maximum value, so columns of these "
                     + "types should not be listed in this property, and will result in error(s) during processing. If no columns "
-                    + "are provided, all rows from the table will be considered, which could have a performance impact.")
+                    + "are provided, all rows from the table will be considered, which could have a performance impact. NOTE: It is important "
+                    + "to use consistent max-value column names for a given table for incremental fetch to work properly.")
             .required(false)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
     public static final PropertyDescriptor QUERY_TIMEOUT = new PropertyDescriptor.Builder()
@@ -129,50 +144,101 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
             .defaultValue("0 seconds")
             .required(true)
             .addValidator(StandardValidators.TIME_PERIOD_VALIDATOR)
+            .expressionLanguageSupported(true)
             .build();
 
-    public static final PropertyDescriptor NORMALIZE_NAMES_FOR_AVRO = new PropertyDescriptor.Builder()
-            .name("dbf-normalize")
-            .displayName("Normalize Table/Column Names")
-            .description("Whether to change non-Avro-compatible characters in column names to Avro-compatible characters. For example, colons and periods "
-                    + "will be changed to underscores in order to build a valid Avro record.")
-            .allowableValues("true", "false")
-            .defaultValue("false")
-            .required(true)
+    public static final PropertyDescriptor WHERE_CLAUSE = new PropertyDescriptor.Builder()
+            .name("db-fetch-where-clause")
+            .displayName("Additional WHERE clause")
+            .description("A custom clause to be added in the WHERE condition when generating SQL requests.")
+            .required(false)
+            .expressionLanguageSupported(true)
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
     protected List<PropertyDescriptor> propDescriptors;
+
+    // The delimiter to use when referencing qualified names (such as table@!@column in the state map)
+    protected static final String NAMESPACE_DELIMITER = "@!@";
 
     public static final PropertyDescriptor DB_TYPE;
 
     protected final static Map<String, DatabaseAdapter> dbAdapters = new HashMap<>();
     protected final Map<String, Integer> columnTypeMap = new HashMap<>();
 
+    // This value is set when the processor is scheduled and indicates whether the Table Name property contains Expression Language.
+    // It is used for backwards-compatibility purposes; if the value is false and the fully-qualified state key (table + column) is not found,
+    // the processor will look for a state key with just the column name.
+    protected volatile boolean isDynamicTableName = false;
+
+    // This value is set when the processor is scheduled and indicates whether the Maximum Value Columns property contains Expression Language.
+    // It is used for backwards-compatibility purposes; if the table name and max-value columns are static, then the column types can be
+    // pre-fetched when the processor is scheduled, rather than having to populate them on-the-fly.
+    protected volatile boolean isDynamicMaxValues = false;
+
     private static SimpleDateFormat TIME_TYPE_FORMAT = new SimpleDateFormat("HH:mm:ss.SSS");
+
+    // A Map (name to value) of initial maximum-value properties, filled at schedule-time and used at trigger-time
+    protected Map<String,String> maxValueProperties;
 
     static {
         // Load the DatabaseAdapters
+        ArrayList<AllowableValue> dbAdapterValues = new ArrayList<>();
         ServiceLoader<DatabaseAdapter> dbAdapterLoader = ServiceLoader.load(DatabaseAdapter.class);
-        dbAdapterLoader.forEach(it -> dbAdapters.put(it.getName(), it));
+        dbAdapterLoader.forEach(it -> {
+            dbAdapters.put(it.getName(), it);
+            dbAdapterValues.add(new AllowableValue(it.getName(), it.getName(), it.getDescription()));
+        });
 
         DB_TYPE = new PropertyDescriptor.Builder()
                 .name("db-fetch-db-type")
                 .displayName("Database Type")
                 .description("The type/flavor of database, used for generating database-specific code. In many cases the Generic type "
                         + "should suffice, but some databases (such as Oracle) require custom SQL clauses. ")
-                .allowableValues(dbAdapters.keySet())
-                .defaultValue(dbAdapters.values().stream().findFirst().get().getName())
+                .allowableValues(dbAdapterValues.toArray(new AllowableValue[dbAdapterValues.size()]))
+                .defaultValue("Generic")
                 .required(true)
                 .build();
     }
 
+    @Override
+    protected PropertyDescriptor getSupportedDynamicPropertyDescriptor(final String propertyDescriptorName) {
+        return new PropertyDescriptor.Builder()
+                .name(propertyDescriptorName)
+                .required(false)
+                .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(AttributeExpression.ResultType.STRING, true))
+                .addValidator(StandardValidators.ATTRIBUTE_KEY_PROPERTY_NAME_VALIDATOR)
+                .expressionLanguageSupported(true)
+                .dynamic(true)
+                .build();
+    }
+
+    // A common validation procedure for DB fetch processors, it stores whether the Table Name and/or Max Value Column properties have expression language
+    protected Collection<ValidationResult> customValidate(ValidationContext validationContext) {
+        // For backwards-compatibility, keep track of whether the table name and max-value column properties are dynamic (i.e. has expression language)
+        isDynamicTableName = validationContext.isExpressionLanguagePresent(validationContext.getProperty(TABLE_NAME).getValue());
+        isDynamicMaxValues = validationContext.isExpressionLanguagePresent(validationContext.getProperty(MAX_VALUE_COLUMN_NAMES).getValue());
+
+        return super.customValidate(validationContext);
+    }
+
     public void setup(final ProcessContext context) {
+        setup(context,true,null);
+    }
+
+    public void setup(final ProcessContext context, boolean shouldCleanCache, FlowFile flowFile) {
+        final String maxValueColumnNames = context.getProperty(MAX_VALUE_COLUMN_NAMES).evaluateAttributeExpressions(flowFile).getValue();
+
+        // If there are no max-value column names specified, we don't need to perform this processing
+        if (StringUtils.isEmpty(maxValueColumnNames)) {
+            return;
+        }
+
         // Try to fill the columnTypeMap with the types of the desired max-value columns
         final DBCPService dbcpService = context.getProperty(DBCP_SERVICE).asControllerService(DBCPService.class);
-        final String tableName = context.getProperty(TABLE_NAME).getValue();
-        final String maxValueColumnNames = context.getProperty(MAX_VALUE_COLUMN_NAMES).getValue();
-        final DatabaseAdapter dbAdapter = dbAdapters.get(context.getProperty(DB_TYPE).getValue());
+        final String tableName = context.getProperty(TABLE_NAME).evaluateAttributeExpressions(flowFile).getValue();
 
+        final DatabaseAdapter dbAdapter = dbAdapters.get(context.getProperty(DB_TYPE).getValue());
         try (final Connection con = dbcpService.getConnection();
              final Statement st = con.createStatement()) {
 
@@ -184,13 +250,15 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
             ResultSetMetaData resultSetMetaData = resultSet.getMetaData();
             int numCols = resultSetMetaData.getColumnCount();
             if (numCols > 0) {
-                columnTypeMap.clear();
+                if (shouldCleanCache){
+                    columnTypeMap.clear();
+                }
                 for (int i = 1; i <= numCols; i++) {
                     String colName = resultSetMetaData.getColumnName(i).toLowerCase();
+                    String colKey = getStateKey(tableName, colName);
                     int colType = resultSetMetaData.getColumnType(i);
-                    columnTypeMap.put(colName, colType);
+                    columnTypeMap.putIfAbsent(colKey, colType);
                 }
-
             } else {
                 throw new ProcessException("No columns found in table from those specified: " + maxValueColumnNames);
             }
@@ -307,26 +375,20 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
                 break;
 
             case TIMESTAMP:
-                // Oracle timestamp queries must use literals in java.sql.Date format
-                if ("Oracle".equals(databaseType)) {
-                    Date rawColOracleTimestampValue = resultSet.getDate(columnIndex);
-                    java.sql.Date oracleTimestampValue = new java.sql.Date(rawColOracleTimestampValue.getTime());
-                    java.sql.Date maxOracleTimestampValue = null;
-                    if (maxValueString != null) {
-                        maxOracleTimestampValue = java.sql.Date.valueOf(maxValueString);
-                    }
-                    if (maxOracleTimestampValue == null || oracleTimestampValue.after(maxOracleTimestampValue)) {
-                        return oracleTimestampValue.toString();
-                    }
-                } else {
-                    Timestamp colTimestampValue = resultSet.getTimestamp(columnIndex);
-                    java.sql.Timestamp maxTimestampValue = null;
-                    if (maxValueString != null) {
+                Timestamp colTimestampValue = resultSet.getTimestamp(columnIndex);
+                java.sql.Timestamp maxTimestampValue = null;
+                if (maxValueString != null) {
+                    // For backwards compatibility, the type might be TIMESTAMP but the state value is in DATE format. This should be a one-time occurrence as the next maximum value
+                    // should be stored as a full timestamp. Even so, check to see if the value is missing time-of-day information, and use the "date" coercion rather than the
+                    // "timestamp" coercion in that case
+                    try {
                         maxTimestampValue = java.sql.Timestamp.valueOf(maxValueString);
+                    } catch (IllegalArgumentException iae) {
+                        maxTimestampValue = new java.sql.Timestamp(java.sql.Date.valueOf(maxValueString).getTime());
                     }
-                    if (maxTimestampValue == null || colTimestampValue.after(maxTimestampValue)) {
-                        return colTimestampValue.toString();
-                    }
+                }
+                if (maxTimestampValue == null || colTimestampValue.after(maxTimestampValue)) {
+                    return colTimestampValue.toString();
                 }
                 break;
 
@@ -367,9 +429,15 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
             case TIME:
                 return "'" + value + "'";
             case TIMESTAMP:
-                // Timestamp literals in Oracle need to be cast with TO_DATE
                 if ("Oracle".equals(databaseType)) {
-                    return "to_date('" + value + "', 'yyyy-mm-dd HH24:MI:SS')";
+                    // For backwards compatibility, the type might be TIMESTAMP but the state value is in DATE format. This should be a one-time occurrence as the next maximum value
+                    // should be stored as a full timestamp. Even so, check to see if the value is missing time-of-day information, and use the "date" coercion rather than the
+                    // "timestamp" coercion in that case
+                    if (value.matches("\\d{4}-\\d{2}-\\d{2}")) {
+                        return "date '" + value + "'";
+                    } else {
+                        return "timestamp '" + value + "'";
+                    }
                 } else {
                     return "'" + value + "'";
                 }
@@ -377,5 +445,33 @@ public abstract class AbstractDatabaseFetchProcessor extends AbstractSessionFact
             default:
                 return value;
         }
+    }
+
+    protected static String getStateKey(String prefix, String columnName) {
+        StringBuilder sb = new StringBuilder();
+        if (prefix != null) {
+            sb.append(prefix.toLowerCase());
+            sb.append(NAMESPACE_DELIMITER);
+        }
+        if (columnName != null) {
+            sb.append(columnName.toLowerCase());
+        }
+        return sb.toString();
+    }
+
+    protected Map<String,String> getDefaultMaxValueProperties(final Map<PropertyDescriptor, String> properties){
+        final Map<String,String> defaultMaxValues = new HashMap<>();
+
+        for (final Map.Entry<PropertyDescriptor, String> entry : properties.entrySet()) {
+            final String key = entry.getKey().getName();
+
+            if(!key.startsWith(INITIAL_MAX_VALUE_PROP_START)) {
+                continue;
+            }
+
+            defaultMaxValues.put(key.substring(INITIAL_MAX_VALUE_PROP_START.length()), entry.getValue());
+        }
+
+        return defaultMaxValues;
     }
 }

@@ -16,12 +16,12 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
@@ -30,6 +30,7 @@ import org.apache.nifi.authorization.user.NiFiUserUtils;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
 import org.apache.nifi.web.api.dto.PortDTO;
+import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.entity.PortEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
@@ -101,7 +102,7 @@ public class InputPortResource extends ApplicationResource {
             value = "Gets an input port",
             response = PortEntity.class,
             authorizations = {
-                    @Authorization(value = "Read - /input-ports/{uuid}", type = "")
+                    @Authorization(value = "Read - /input-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -134,7 +135,7 @@ public class InputPortResource extends ApplicationResource {
         final PortEntity entity = serviceFacade.getInputPort(id);
         populateRemainingInputPortEntityContent(entity);
 
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -153,7 +154,7 @@ public class InputPortResource extends ApplicationResource {
             value = "Updates an input port",
             response = PortEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /input-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /input-ports/{uuid}")
             }
     )
     @ApiResponses(
@@ -192,6 +193,13 @@ public class InputPortResource extends ApplicationResource {
                     + "input port id of the requested resource (%s).", requestPortDTO.getId(), id));
         }
 
+        final PositionDTO proposedPosition = requestPortDTO.getPosition();
+        if (proposedPosition != null) {
+            if (proposedPosition.getX() == null || proposedPosition.getY() == null) {
+                throw new IllegalArgumentException("The x and y coordinate of the proposed position must be specified.");
+            }
+        }
+
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestPortEntity);
         }
@@ -214,7 +222,7 @@ public class InputPortResource extends ApplicationResource {
                     final PortEntity entity = serviceFacade.updateInputPort(revision, portDTO);
                     populateRemainingInputPortEntityContent(entity);
 
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }
@@ -236,7 +244,8 @@ public class InputPortResource extends ApplicationResource {
             value = "Deletes an input port",
             response = PortEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /input-ports/{uuid}", type = "")
+                    @Authorization(value = "Write - /input-ports/{uuid}"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}")
             }
     )
     @ApiResponses(
@@ -281,13 +290,18 @@ public class InputPortResource extends ApplicationResource {
                 requestRevision,
                 lookup -> {
                     final Authorizable inputPort = lookup.getInputPort(id);
+
+                    // ensure write permission to the input port
                     inputPort.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+
+                    // ensure write permission to the parent process group
+                    inputPort.getParentAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
                 },
                 () -> serviceFacade.verifyDeleteInputPort(id),
                 (revision, portEntity) -> {
                     // delete the specified input port
                     final PortEntity entity = serviceFacade.deleteInputPort(revision, portEntity.getId());
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }

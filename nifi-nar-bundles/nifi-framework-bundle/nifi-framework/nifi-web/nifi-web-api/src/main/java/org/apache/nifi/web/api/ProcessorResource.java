@@ -16,16 +16,16 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
 import org.apache.nifi.authorization.Authorizer;
-import org.apache.nifi.authorization.ConfigurableComponentAuthorizable;
+import org.apache.nifi.authorization.ComponentAuthorizable;
 import org.apache.nifi.authorization.RequestAction;
 import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.user.NiFiUser;
@@ -35,7 +35,9 @@ import org.apache.nifi.ui.extension.UiExtensionMapping;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
 import org.apache.nifi.web.UiExtensionType;
+import org.apache.nifi.web.api.dto.BundleDTO;
 import org.apache.nifi.web.api.dto.ComponentStateDTO;
+import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.dto.ProcessorConfigDTO;
 import org.apache.nifi.web.api.dto.ProcessorDTO;
 import org.apache.nifi.web.api.dto.PropertyDescriptorDTO;
@@ -120,10 +122,12 @@ public class ProcessorResource extends ApplicationResource {
             if (StringUtils.isNotBlank(customUiUrl)) {
                 config.setCustomUiUrl(customUiUrl);
             } else {
+                final BundleDTO bundle = processor.getBundle();
+
                 // see if this processor has any ui extensions
                 final UiExtensionMapping uiExtensionMapping = (UiExtensionMapping) servletContext.getAttribute("nifi-ui-extensions");
-                if (uiExtensionMapping.hasUiExtension(processor.getType())) {
-                    final List<UiExtension> uiExtensions = uiExtensionMapping.getUiExtension(processor.getType());
+                if (uiExtensionMapping.hasUiExtension(processor.getType(), bundle.getGroup(), bundle.getArtifact(), bundle.getVersion())) {
+                    final List<UiExtension> uiExtensions = uiExtensionMapping.getUiExtension(processor.getType(), bundle.getGroup(), bundle.getArtifact(), bundle.getVersion());
                     for (final UiExtension uiExtension : uiExtensions) {
                         if (UiExtensionType.ProcessorConfiguration.equals(uiExtension.getExtensionType())) {
                             config.setCustomUiUrl(uiExtension.getContextPath() + "/configure");
@@ -151,7 +155,7 @@ public class ProcessorResource extends ApplicationResource {
             value = "Gets a processor",
             response = ProcessorEntity.class,
             authorizations = {
-                    @Authorization(value = "Read - /processors/{uuid}", type = "")
+                    @Authorization(value = "Read - /processors/{uuid}")
             }
     )
     @ApiResponses(
@@ -185,7 +189,7 @@ public class ProcessorResource extends ApplicationResource {
         populateRemainingProcessorEntityContent(entity);
 
         // generate the response
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -204,7 +208,7 @@ public class ProcessorResource extends ApplicationResource {
             value = "Gets the descriptor for a processor property",
             response = PropertyDescriptorEntity.class,
             authorizations = {
-                    @Authorization(value = "Read - /processors/{uuid}", type = "")
+                    @Authorization(value = "Read - /processors/{uuid}")
             }
     )
     @ApiResponses(
@@ -256,7 +260,7 @@ public class ProcessorResource extends ApplicationResource {
         entity.setPropertyDescriptor(descriptor);
 
         // generate the response
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -272,9 +276,9 @@ public class ProcessorResource extends ApplicationResource {
     @Path("/{id}/state")
     @ApiOperation(
             value = "Gets the state for a processor",
-            response = ComponentStateDTO.class,
+            response = ComponentStateEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /processors/{uuid}", type = "")
+                    @Authorization(value = "Write - /processors/{uuid}")
             }
     )
     @ApiResponses(
@@ -311,7 +315,7 @@ public class ProcessorResource extends ApplicationResource {
         entity.setComponentState(state);
 
         // generate the response
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -328,9 +332,9 @@ public class ProcessorResource extends ApplicationResource {
     @Path("{id}/state/clear-requests")
     @ApiOperation(
             value = "Clears the state for a processor",
-            response = ComponentStateDTO.class,
+            response = ComponentStateEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /processors/{uuid}", type = "")
+                    @Authorization(value = "Write - /processors/{uuid}")
             }
     )
     @ApiResponses(
@@ -373,7 +377,7 @@ public class ProcessorResource extends ApplicationResource {
                     final ComponentStateEntity entity = new ComponentStateEntity();
 
                     // generate the response
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }
@@ -395,8 +399,8 @@ public class ProcessorResource extends ApplicationResource {
             value = "Updates a processor",
             response = ProcessorEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /processors/{uuid}", type = ""),
-                    @Authorization(value = "Read - any referenced Controller Services if this request changes the reference - /controller-services/{uuid}", type = "")
+                    @Authorization(value = "Write - /processors/{uuid}"),
+                    @Authorization(value = "Read - any referenced Controller Services if this request changes the reference - /controller-services/{uuid}")
             }
     )
     @ApiResponses(
@@ -435,6 +439,13 @@ public class ProcessorResource extends ApplicationResource {
                     + "not equal the processor id of the requested resource (%s).", requestProcessorDTO.getId(), id));
         }
 
+        final PositionDTO proposedPosition = requestProcessorDTO.getPosition();
+        if (proposedPosition != null) {
+            if (proposedPosition.getX() == null || proposedPosition.getY() == null) {
+                throw new IllegalArgumentException("The x and y coordinate of the proposed position must be specified.");
+            }
+        }
+
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestProcessorEntity);
         }
@@ -448,7 +459,7 @@ public class ProcessorResource extends ApplicationResource {
                 lookup -> {
                     final NiFiUser user = NiFiUserUtils.getNiFiUser();
 
-                    final ConfigurableComponentAuthorizable authorizable = lookup.getProcessor(id);
+                    final ComponentAuthorizable authorizable = lookup.getProcessor(id);
                     authorizable.getAuthorizable().authorize(authorizer, RequestAction.WRITE, user);
 
                     final ProcessorConfigDTO config = requestProcessorDTO.getConfig();
@@ -464,7 +475,7 @@ public class ProcessorResource extends ApplicationResource {
                     final ProcessorEntity entity = serviceFacade.updateProcessor(revision, processorDTO);
                     populateRemainingProcessorEntityContent(entity);
 
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }
@@ -487,8 +498,9 @@ public class ProcessorResource extends ApplicationResource {
             value = "Deletes a processor",
             response = ProcessorEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /processors/{uuid}", type = ""),
-                    @Authorization(value = "Read - any referenced Controller Services - /controller-services/{uuid}", type = "")
+                    @Authorization(value = "Write - /processors/{uuid}"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}"),
+                    @Authorization(value = "Read - any referenced Controller Services - /controller-services/{uuid}")
             }
     )
     @ApiResponses(
@@ -531,8 +543,13 @@ public class ProcessorResource extends ApplicationResource {
                 requestProcessorEntity,
                 requestRevision,
                 lookup -> {
-                    final ConfigurableComponentAuthorizable processor = lookup.getProcessor(id);
+                    final ComponentAuthorizable processor = lookup.getProcessor(id);
+
+                    // ensure write permission to the processor
                     processor.getAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+
+                    // ensure write permission to the parent process group
+                    processor.getAuthorizable().getParentAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
 
                     // verify any referenced services
                     AuthorizeControllerServiceReference.authorizeControllerServiceReferences(processor, authorizer, lookup, false);
@@ -543,7 +560,7 @@ public class ProcessorResource extends ApplicationResource {
                     final ProcessorEntity entity = serviceFacade.deleteProcessor(revision, processorEntity.getId());
 
                     // generate the response
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }

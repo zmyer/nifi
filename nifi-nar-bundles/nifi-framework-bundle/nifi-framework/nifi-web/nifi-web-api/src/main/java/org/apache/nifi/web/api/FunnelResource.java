@@ -16,12 +16,12 @@
  */
 package org.apache.nifi.web.api;
 
-import com.wordnik.swagger.annotations.Api;
-import com.wordnik.swagger.annotations.ApiOperation;
-import com.wordnik.swagger.annotations.ApiParam;
-import com.wordnik.swagger.annotations.ApiResponse;
-import com.wordnik.swagger.annotations.ApiResponses;
-import com.wordnik.swagger.annotations.Authorization;
+import io.swagger.annotations.Api;
+import io.swagger.annotations.ApiOperation;
+import io.swagger.annotations.ApiParam;
+import io.swagger.annotations.ApiResponse;
+import io.swagger.annotations.ApiResponses;
+import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
@@ -30,6 +30,7 @@ import org.apache.nifi.authorization.user.NiFiUserUtils;
 import org.apache.nifi.web.NiFiServiceFacade;
 import org.apache.nifi.web.Revision;
 import org.apache.nifi.web.api.dto.FunnelDTO;
+import org.apache.nifi.web.api.dto.PositionDTO;
 import org.apache.nifi.web.api.entity.FunnelEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
@@ -101,7 +102,7 @@ public class FunnelResource extends ApplicationResource {
             value = "Gets a funnel",
             response = FunnelEntity.class,
             authorizations = {
-                    @Authorization(value = "Read - /funnels/{uuid}", type = "")
+                    @Authorization(value = "Read - /funnels/{uuid}")
             }
     )
     @ApiResponses(
@@ -134,7 +135,7 @@ public class FunnelResource extends ApplicationResource {
         final FunnelEntity entity = serviceFacade.getFunnel(id);
         populateRemainingFunnelEntityContent(entity);
 
-        return clusterContext(generateOkResponse(entity)).build();
+        return generateOkResponse(entity).build();
     }
 
     /**
@@ -153,7 +154,7 @@ public class FunnelResource extends ApplicationResource {
             value = "Updates a funnel",
             response = FunnelEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /funnels/{uuid}", type = "")
+                    @Authorization(value = "Write - /funnels/{uuid}")
             }
     )
     @ApiResponses(
@@ -192,6 +193,13 @@ public class FunnelResource extends ApplicationResource {
                     + "funnel id of the requested resource (%s).", requestFunnelDTO.getId(), id));
         }
 
+        final PositionDTO proposedPosition = requestFunnelDTO.getPosition();
+        if (proposedPosition != null) {
+            if (proposedPosition.getX() == null || proposedPosition.getY() == null) {
+                throw new IllegalArgumentException("The x and y coordinate of the proposed position must be specified.");
+            }
+        }
+
         if (isReplicateRequest()) {
             return replicate(HttpMethod.PUT, requestFunnelEntity);
         }
@@ -212,7 +220,7 @@ public class FunnelResource extends ApplicationResource {
                     final FunnelEntity entity = serviceFacade.updateFunnel(revision, funnelEntity.getComponent());
                     populateRemainingFunnelEntityContent(entity);
 
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }
@@ -237,7 +245,8 @@ public class FunnelResource extends ApplicationResource {
             value = "Deletes a funnel",
             response = FunnelEntity.class,
             authorizations = {
-                    @Authorization(value = "Write - /funnels/{uuid}", type = "")
+                    @Authorization(value = "Write - /funnels/{uuid}"),
+                    @Authorization(value = "Write - Parent Process Group - /process-groups/{uuid}")
             }
     )
     @ApiResponses(
@@ -282,13 +291,18 @@ public class FunnelResource extends ApplicationResource {
                 requestRevision,
                 lookup -> {
                     final Authorizable funnel = lookup.getFunnel(id);
+
+                    // ensure write permission to the funnel
                     funnel.authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
+
+                    // ensure write permission to the parent process group
+                    funnel.getParentAuthorizable().authorize(authorizer, RequestAction.WRITE, NiFiUserUtils.getNiFiUser());
                 },
                 () -> serviceFacade.verifyDeleteFunnel(id),
                 (revision, funnelEntity) -> {
                     // delete the specified funnel
                     final FunnelEntity entity = serviceFacade.deleteFunnel(revision, funnelEntity.getId());
-                    return clusterContext(generateOkResponse(entity)).build();
+                    return generateOkResponse(entity).build();
                 }
         );
     }

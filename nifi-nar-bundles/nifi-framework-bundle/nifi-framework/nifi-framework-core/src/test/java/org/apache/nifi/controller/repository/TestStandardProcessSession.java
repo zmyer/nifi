@@ -16,14 +16,44 @@
  */
 package org.apache.nifi.controller.repository;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.notNull;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.when;
+import org.apache.nifi.connectable.Connectable;
+import org.apache.nifi.connectable.ConnectableType;
+import org.apache.nifi.connectable.Connection;
+import org.apache.nifi.controller.ProcessScheduler;
+import org.apache.nifi.controller.StandardFlowFileQueue;
+import org.apache.nifi.controller.queue.FlowFileQueue;
+import org.apache.nifi.controller.repository.claim.ContentClaim;
+import org.apache.nifi.controller.repository.claim.ResourceClaim;
+import org.apache.nifi.controller.repository.claim.ResourceClaimManager;
+import org.apache.nifi.controller.repository.claim.StandardContentClaim;
+import org.apache.nifi.controller.repository.claim.StandardResourceClaimManager;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
+import org.apache.nifi.groups.ProcessGroup;
+import org.apache.nifi.processor.FlowFileFilter;
+import org.apache.nifi.processor.FlowFileFilter.FlowFileFilterResult;
+import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.exception.FlowFileAccessException;
+import org.apache.nifi.processor.exception.MissingFlowFileException;
+import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processor.io.InputStreamCallback;
+import org.apache.nifi.processor.io.OutputStreamCallback;
+import org.apache.nifi.processor.io.StreamCallback;
+import org.apache.nifi.provenance.MockProvenanceRepository;
+import org.apache.nifi.provenance.ProvenanceEventRecord;
+import org.apache.nifi.provenance.ProvenanceEventRepository;
+import org.apache.nifi.provenance.ProvenanceEventType;
+import org.apache.nifi.stream.io.StreamUtils;
+import org.apache.nifi.util.MockFlowFile;
+import org.apache.nifi.util.NiFiProperties;
+import org.junit.After;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.Ignore;
+import org.junit.Test;
+import org.mockito.Mockito;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -54,41 +84,17 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Pattern;
 
-import org.apache.nifi.connectable.Connectable;
-import org.apache.nifi.connectable.ConnectableType;
-import org.apache.nifi.connectable.Connection;
-import org.apache.nifi.controller.ProcessScheduler;
-import org.apache.nifi.controller.StandardFlowFileQueue;
-import org.apache.nifi.controller.queue.FlowFileQueue;
-import org.apache.nifi.controller.repository.claim.ContentClaim;
-import org.apache.nifi.controller.repository.claim.ResourceClaim;
-import org.apache.nifi.controller.repository.claim.ResourceClaimManager;
-import org.apache.nifi.controller.repository.claim.StandardContentClaim;
-import org.apache.nifi.controller.repository.claim.StandardResourceClaimManager;
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.flowfile.attributes.CoreAttributes;
-import org.apache.nifi.groups.ProcessGroup;
-import org.apache.nifi.processor.FlowFileFilter;
-import org.apache.nifi.processor.Relationship;
-import org.apache.nifi.processor.exception.FlowFileAccessException;
-import org.apache.nifi.processor.exception.MissingFlowFileException;
-import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.processor.io.InputStreamCallback;
-import org.apache.nifi.processor.io.OutputStreamCallback;
-import org.apache.nifi.processor.io.StreamCallback;
-import org.apache.nifi.provenance.MockProvenanceRepository;
-import org.apache.nifi.provenance.ProvenanceEventRecord;
-import org.apache.nifi.provenance.ProvenanceEventRepository;
-import org.apache.nifi.provenance.ProvenanceEventType;
-import org.apache.nifi.stream.io.StreamUtils;
-import org.apache.nifi.util.NiFiProperties;
-import org.junit.After;
-import org.junit.Assert;
-import org.junit.Before;
-import org.junit.Test;
-import org.mockito.Mockito;
-import org.mockito.invocation.InvocationOnMock;
-import org.mockito.stubbing.Answer;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.notNull;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 public class TestStandardProcessSession {
 
@@ -96,6 +102,7 @@ public class TestStandardProcessSession {
     private MockContentRepository contentRepo;
     private FlowFileQueue flowFileQueue;
     private ProcessContext context;
+    private Connectable connectable;
 
     private ProvenanceEventRepository provenanceRepo;
     private MockFlowFileRepository flowFileRepo;
@@ -136,7 +143,6 @@ public class TestStandardProcessSession {
     }
 
     @Before
-    @SuppressWarnings("unchecked")
     public void setup() throws IOException {
         resourceClaimManager = new StandardResourceClaimManager();
 
@@ -145,33 +151,7 @@ public class TestStandardProcessSession {
         final CounterRepository counterRepo = Mockito.mock(CounterRepository.class);
         provenanceRepo = new MockProvenanceRepository();
 
-        final Connection connection = Mockito.mock(Connection.class);
-        final ProcessScheduler processScheduler = Mockito.mock(ProcessScheduler.class);
-
-        final FlowFileSwapManager swapManager = Mockito.mock(FlowFileSwapManager.class);
-        final StandardFlowFileQueue actualQueue = new StandardFlowFileQueue("1", connection, flowFileRepo, provenanceRepo, null, processScheduler, swapManager, null, 10000);
-        flowFileQueue = Mockito.spy(actualQueue);
-        when(connection.getFlowFileQueue()).thenReturn(flowFileQueue);
-
-        Mockito.doAnswer(new Answer<Object>() {
-            @Override
-            public Object answer(InvocationOnMock invocation) throws Throwable {
-                flowFileQueue.put((FlowFileRecord) invocation.getArguments()[0]);
-                return null;
-            }
-        }).when(connection).enqueue(Mockito.any(FlowFileRecord.class));
-
-        Mockito.doAnswer(new Answer<Object>() {
-            @Override
-            public Object answer(InvocationOnMock invocation) throws Throwable {
-                flowFileQueue.putAll((Collection<FlowFileRecord>) invocation.getArguments()[0]);
-                return null;
-            }
-        }).when(connection).enqueue(Mockito.any(Collection.class));
-
-        final Connectable dest = Mockito.mock(Connectable.class);
-        when(connection.getDestination()).thenReturn(dest);
-        when(connection.getSource()).thenReturn(dest);
+        final Connection connection = createConnection();
 
         final List<Connection> connList = new ArrayList<>();
         connList.add(connection);
@@ -179,7 +159,7 @@ public class TestStandardProcessSession {
         final ProcessGroup procGroup = Mockito.mock(ProcessGroup.class);
         when(procGroup.getIdentifier()).thenReturn("proc-group-identifier-1");
 
-        final Connectable connectable = Mockito.mock(Connectable.class);
+        connectable = Mockito.mock(Connectable.class);
         when(connectable.hasIncomingConnection()).thenReturn(true);
         when(connectable.getIncomingConnections()).thenReturn(connList);
         when(connectable.getProcessGroup()).thenReturn(procGroup);
@@ -210,6 +190,267 @@ public class TestStandardProcessSession {
 
         context = new ProcessContext(connectable, new AtomicLong(0L), contentRepo, flowFileRepo, flowFileEventRepo, counterRepo, provenanceRepo);
         session = new StandardProcessSession(context);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Connection createConnection() {
+        AtomicReference<FlowFileQueue> queueReference = new AtomicReference<>(flowFileQueue);
+        Connection connection = createConnection(queueReference);
+        flowFileQueue = queueReference.get();
+
+        return connection;
+    }
+
+    private FlowFileQueue createFlowFileQueueSpy(Connection connection) {
+        final FlowFileSwapManager swapManager = Mockito.mock(FlowFileSwapManager.class);
+        final ProcessScheduler processScheduler = Mockito.mock(ProcessScheduler.class);
+
+        final StandardFlowFileQueue actualQueue = new StandardFlowFileQueue("1", connection, flowFileRepo, provenanceRepo, null,
+                processScheduler, swapManager, null, 10000);
+        return Mockito.spy(actualQueue);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Connection createConnection(AtomicReference<FlowFileQueue> flowFileQueueReference) {
+        final Connection connection = Mockito.mock(Connection.class);
+
+        FlowFileQueue flowFileQueueFromReference = flowFileQueueReference.get();
+
+        final FlowFileQueue localFlowFileQueue;
+
+        if (flowFileQueueFromReference == null) {
+            localFlowFileQueue = createFlowFileQueueSpy(connection);
+            flowFileQueueReference.set(localFlowFileQueue);
+        } else {
+            localFlowFileQueue = flowFileQueueFromReference;
+        }
+
+        when(connection.getFlowFileQueue()).thenReturn(localFlowFileQueue);
+
+        Mockito.doAnswer(new Answer<Object>() {
+            @Override
+            public Object answer(InvocationOnMock invocation) throws Throwable {
+                localFlowFileQueue.put((FlowFileRecord) invocation.getArguments()[0]);
+                return null;
+            }
+        }).when(connection).enqueue(Mockito.any(FlowFileRecord.class));
+
+        Mockito.doAnswer(new Answer<Object>() {
+            @Override
+            public Object answer(InvocationOnMock invocation) throws Throwable {
+                localFlowFileQueue.putAll((Collection<FlowFileRecord>) invocation.getArguments()[0]);
+                return null;
+            }
+        }).when(connection).enqueue(Mockito.any(Collection.class));
+
+        final Connectable dest = Mockito.mock(Connectable.class);
+        when(connection.getDestination()).thenReturn(dest);
+        when(connection.getSource()).thenReturn(dest);
+
+        Mockito.doAnswer(new Answer<FlowFile>() {
+            @Override
+            public FlowFile answer(InvocationOnMock invocation) throws Throwable {
+                return localFlowFileQueue.poll(invocation.getArgumentAt(0, Set.class));
+            }
+        }).when(connection).poll(any(Set.class));
+
+        Mockito.doAnswer(new Answer<List<FlowFileRecord>>() {
+            @Override
+            public List<FlowFileRecord> answer(InvocationOnMock invocation) throws Throwable {
+                return localFlowFileQueue.poll(invocation.getArgumentAt(0, FlowFileFilter.class), invocation.getArgumentAt(1, Set.class));
+            }
+        }).when(connection).poll(any(FlowFileFilter.class), any(Set.class));
+
+        return connection;
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testRoundRobinOnSessionGetNoArgs() {
+        final List<Connection> connList = new ArrayList<>();
+        final Connection conn1 = createConnection();
+        final Connection conn2 = createConnection();
+        connList.add(conn1);
+        connList.add(conn2);
+
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .id(1000L)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+        flowFileQueue.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(connList);
+
+        session.get();
+        session.get();
+
+        verify(conn1, times(1)).poll(any(Set.class));
+        verify(conn2, times(1)).poll(any(Set.class));
+    }
+
+    @Test
+    public void testCloneOriginalDataSmaller() throws IOException {
+        final byte[] originalContent = "hello".getBytes();
+        final byte[] replacementContent = "NEW DATA".getBytes();
+
+        final Connection conn1 = createConnection();
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .id(1000L)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .contentClaim(contentRepo.create(originalContent))
+            .size(originalContent.length)
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(Collections.singletonList(conn1));
+
+        final FlowFile input = session.get();
+        assertEquals(originalContent.length, input.getSize());
+
+        final FlowFile modified = session.write(input, (in, out) -> out.write(replacementContent));
+        assertEquals(replacementContent.length, modified.getSize());
+
+        // Clone 'input', not 'modified' because we want to ensure that we use the outdated reference to ensure
+        // that the framework uses the most current reference.
+        final FlowFile clone = session.clone(input);
+        assertEquals(replacementContent.length, clone.getSize());
+
+        final byte[] buffer = new byte[replacementContent.length];
+        try (final InputStream in = session.read(clone)) {
+            StreamUtils.fillBuffer(in, buffer);
+        }
+
+        assertArrayEquals(replacementContent, buffer);
+    }
+
+    @Test
+    public void testCloneOriginalDataLarger() throws IOException {
+        final byte[] originalContent = "hello there 12345".getBytes();
+        final byte[] replacementContent = "NEW DATA".getBytes();
+
+        final Connection conn1 = createConnection();
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .id(1000L)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .contentClaim(contentRepo.create(originalContent))
+            .size(originalContent.length)
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(Collections.singletonList(conn1));
+
+        final FlowFile input = session.get();
+        assertEquals(originalContent.length, input.getSize());
+
+        final FlowFile modified = session.write(input, (in, out) -> out.write(replacementContent));
+        assertEquals(replacementContent.length, modified.getSize());
+
+        // Clone 'input', not 'modified' because we want to ensure that we use the outdated reference to ensure
+        // that the framework uses the most current reference.
+        final FlowFile clone = session.clone(input);
+        assertEquals(replacementContent.length, clone.getSize());
+
+        final byte[] buffer = new byte[replacementContent.length];
+        try (final InputStream in = session.read(clone)) {
+            StreamUtils.fillBuffer(in, buffer);
+        }
+
+        assertArrayEquals(replacementContent, buffer);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testRoundRobinOnSessionGetWithCount() {
+        final List<Connection> connList = new ArrayList<>();
+        final Connection conn1 = createConnection();
+        final Connection conn2 = createConnection();
+        connList.add(conn1);
+        connList.add(conn2);
+
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .id(1000L)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+        flowFileQueue.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(connList);
+
+        session.get(1);
+        session.get(1);
+
+        verify(conn1, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
+        verify(conn2, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testRoundRobinAcrossConnectionsOnSessionGetWithCount() {
+        final AtomicReference<FlowFileQueue> queue1Reference = new AtomicReference<>();
+        final AtomicReference<FlowFileQueue> queue2Reference = new AtomicReference<>();
+
+        final List<Connection> connList = new ArrayList<>();
+        final Connection conn1 = createConnection(queue1Reference);
+        final Connection conn2 = createConnection(queue2Reference);
+        connList.add(conn1);
+        connList.add(conn2);
+
+        final FlowFileQueue queue2 = queue2Reference.get();
+
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+                .id(1000L)
+                .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+                .entryDate(System.currentTimeMillis())
+                .build();
+
+        queue2.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(connList);
+
+        List<FlowFile> result = session.get(2);
+
+        assertEquals(1, result.size());
+
+        verify(conn1, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
+        verify(conn2, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    public void testRoundRobinOnSessionGetWithFilter() {
+        final List<Connection> connList = new ArrayList<>();
+        final Connection conn1 = createConnection();
+        final Connection conn2 = createConnection();
+        connList.add(conn1);
+        connList.add(conn2);
+
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .id(1000L)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+        flowFileQueue.put(flowFileRecord);
+
+        when(connectable.getIncomingConnections()).thenReturn(connList);
+
+        final FlowFileFilter filter = ff -> FlowFileFilterResult.ACCEPT_AND_TERMINATE;
+
+        session.get(filter);
+        session.get(filter);
+
+        verify(conn1, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
+        verify(conn2, times(1)).poll(any(FlowFileFilter.class), any(Set.class));
     }
 
     @Test
@@ -391,19 +632,19 @@ public class TestStandardProcessSession {
             outputStream.write(new byte[0]);
             Assert.fail("Expected OutputStream to be disabled; was able to call write(byte[])");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             outputStream.write(0);
             Assert.fail("Expected OutputStream to be disabled; was able to call write(int)");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             outputStream.write(new byte[0], 0, 0);
             Assert.fail("Expected OutputStream to be disabled; was able to call write(byte[], int, int)");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
     }
 
@@ -412,31 +653,31 @@ public class TestStandardProcessSession {
             inputStream.read();
             Assert.fail("Expected InputStream to be disabled; was able to call read()");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             inputStream.read(new byte[0]);
             Assert.fail("Expected InputStream to be disabled; was able to call read(byte[])");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             inputStream.read(new byte[0], 0, 0);
             Assert.fail("Expected InputStream to be disabled; was able to call read(byte[], int, int)");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             inputStream.reset();
             Assert.fail("Expected InputStream to be disabled; was able to call reset()");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
         try {
             inputStream.skip(1L);
             Assert.fail("Expected InputStream to be disabled; was able to call skip(long)");
         } catch (final Exception ex) {
-            Assert.assertEquals(FlowFileAccessException.class, ex.getClass());
+            assertEquals(FlowFileAccessException.class, ex.getClass());
         }
     }
 
@@ -986,6 +1227,7 @@ public class TestStandardProcessSession {
     }
 
     @Test
+    @Ignore
     public void testManyFilesOpened() throws IOException {
 
         StandardProcessSession[] standardProcessSessions = new StandardProcessSession[100000];
@@ -1394,7 +1636,17 @@ public class TestStandardProcessSession {
         StreamUtils.fillBuffer(in, buffer);
         assertEquals("hello, world", new String(buffer));
 
+        try {
+            session.remove(flowFile);
+            Assert.fail("Was able to remove FlowFile while an InputStream is open for it");
+        } catch (final IllegalStateException e) {
+            // expected
+        }
+
+        in.close();
+
         session.remove(flowFile);
+
         session.commit(); // This should generate a WARN log message. We can't really test this in a unit test but can verify manually.
     }
 
@@ -1428,6 +1680,96 @@ public class TestStandardProcessSession {
         session.remove(flowFile);
         session.commit();
     }
+
+    @Test
+    public void testWriteToOutputStream() throws IOException {
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .size(12L)
+            .build();
+
+        flowFileQueue.put(flowFileRecord);
+
+        FlowFile flowFile = session.get();
+        try (final OutputStream out = session.write(flowFile)) {
+            out.write("hello, world".getBytes());
+        }
+
+        // Call putAllAttributes, because this will return to us the most recent version
+        // of the FlowFile. In a Processor, we wouldn't need this, but for testing purposes
+        // we need it in order to get the Content Claim.
+        flowFile = session.putAllAttributes(flowFile, Collections.emptyMap());
+        assertEquals(12L, flowFile.getSize());
+
+        final byte[] buffer = new byte[(int) flowFile.getSize()];
+        try (final InputStream in = session.read(flowFile)) {
+            StreamUtils.fillBuffer(in, buffer);
+        }
+
+        assertEquals(new String(buffer), "hello, world");
+    }
+
+    @Test
+    public void testWriteToOutputStreamWhileReading() throws IOException {
+        final ContentClaim claim = contentRepo.create(false);
+        try (final OutputStream out = contentRepo.write(claim)) {
+            out.write("hello, world".getBytes());
+        }
+
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .contentClaim(claim)
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .size(12L)
+            .build();
+        flowFileQueue.put(flowFileRecord);
+
+        final FlowFile flowFile = session.get();
+        InputStream in = session.read(flowFile);
+
+        try {
+            session.write(flowFile);
+            Assert.fail("Was able to obtain an OutputStream for a FlowFile while also holding an InputStream for it");
+        } catch (final IllegalStateException e) {
+            // expected
+        } finally {
+            in.close();
+        }
+
+        // Should now be okay
+        try (final OutputStream out = session.write(flowFile)) {
+
+        }
+    }
+
+    @Test
+    public void testReadFromInputStreamWhileWriting() throws IOException {
+        final FlowFileRecord flowFileRecord = new StandardFlowFileRecord.Builder()
+            .addAttribute("uuid", "12345678-1234-1234-1234-123456789012")
+            .entryDate(System.currentTimeMillis())
+            .size(12L)
+            .build();
+        flowFileQueue.put(flowFileRecord);
+
+        final FlowFile flowFile = session.get();
+        OutputStream out = session.write(flowFile);
+
+        try {
+            session.read(flowFile);
+            Assert.fail("Was able to obtain an InputStream for a FlowFile while also holding an OutputStream for it");
+        } catch (final IllegalStateException e) {
+            // expected
+        } finally {
+            out.close();
+        }
+
+        // Should now be okay
+        try (final InputStream in = session.read(flowFile)) {
+
+        }
+    }
+
 
     @Test
     public void testTransferUnknownRelationship() {
@@ -1488,10 +1830,106 @@ public class TestStandardProcessSession {
         session.commit();
     }
 
+    @Test
+    public void testNewFlowFileModifiedMultipleTimesHasTransientClaimsOnCommit() {
+        FlowFile flowFile = session.create();
+        for (int i = 0; i < 5; i++) {
+            final byte[] content = String.valueOf(i).getBytes();
+            flowFile = session.write(flowFile, out -> out.write(content));
+        }
+
+        session.transfer(flowFile, new Relationship.Builder().name("success").build());
+        session.commit();
+
+        final List<RepositoryRecord> repoUpdates = flowFileRepo.getUpdates();
+        assertEquals(1, repoUpdates.size());
+
+        // Should be 4 transient claims because it was written to 5 times. So 4 transient + 1 actual claim.
+        final RepositoryRecord record = repoUpdates.get(0);
+        assertEquals(RepositoryRecordType.CREATE, record.getType());
+        final List<ContentClaim> transientClaims = record.getTransientClaims();
+        assertEquals(4, transientClaims.size());
+    }
+
+
+    @Test
+    public void testUpdateFlowFileModifiedMultipleTimesHasTransientClaimsOnCommit() {
+        flowFileQueue.put(new MockFlowFile(1L));
+
+        FlowFile flowFile = session.get();
+        for (int i = 0; i < 5; i++) {
+            final byte[] content = String.valueOf(i).getBytes();
+            flowFile = session.write(flowFile, out -> out.write(content));
+        }
+
+        session.transfer(flowFile, new Relationship.Builder().name("success").build());
+        session.commit();
+
+        final List<RepositoryRecord> repoUpdates = flowFileRepo.getUpdates();
+        assertEquals(1, repoUpdates.size());
+
+        // Should be 4 transient claims because it was written to 5 times. So 4 transient + 1 actual claim.
+        final RepositoryRecord record = repoUpdates.get(0);
+        assertEquals(RepositoryRecordType.UPDATE, record.getType());
+        final List<ContentClaim> transientClaims = record.getTransientClaims();
+        assertEquals(4, transientClaims.size());
+    }
+
+
+    @Test
+    public void testUpdateFlowFileModifiedMultipleTimesHasTransientClaimsOnRollback() {
+        flowFileQueue.put(new MockFlowFile(1L));
+
+        FlowFile flowFile = session.get();
+        for (int i = 0; i < 5; i++) {
+            final byte[] content = String.valueOf(i).getBytes();
+            flowFile = session.write(flowFile, out -> out.write(content));
+        }
+
+        session.rollback();
+
+        final List<RepositoryRecord> repoUpdates = flowFileRepo.getUpdates();
+        assertEquals(1, repoUpdates.size());
+
+        // Should be 5 transient claims because it was written to 5 times and then rolled back so all
+        // content claims are 'transient'.
+        final RepositoryRecord record = repoUpdates.get(0);
+        assertEquals(RepositoryRecordType.CLEANUP_TRANSIENT_CLAIMS, record.getType());
+        final List<ContentClaim> transientClaims = record.getTransientClaims();
+        assertEquals(5, transientClaims.size());
+    }
+
+    @Test
+    public void testMultipleReadCounts() throws IOException {
+        flowFileQueue.put(new MockFlowFile(1L));
+
+        FlowFile flowFile = session.get();
+
+        final List<InputStream> streams = new ArrayList<>();
+        for (int i = 0; i < 3; i++) {
+            streams.add(session.read(flowFile));
+        }
+
+        for (int i = 0; i < 3; i++) {
+            try {
+                flowFile = session.putAttribute(flowFile, "counter", String.valueOf(i));
+                Assert.fail("Was able to put attribute while reading");
+            } catch (final IllegalStateException ise) {
+                // expected
+            }
+
+            streams.get(i).close();
+        }
+
+        flowFile = session.putAttribute(flowFile, "counter", "4");
+    }
+
+
     private static class MockFlowFileRepository implements FlowFileRepository {
 
         private boolean failOnUpdate = false;
         private final AtomicLong idGenerator = new AtomicLong(0L);
+        private final List<RepositoryRecord> updates = new ArrayList<>();
 
         public void setFailOnUpdate(final boolean fail) {
             this.failOnUpdate = fail;
@@ -1516,6 +1954,11 @@ public class TestStandardProcessSession {
             if (failOnUpdate) {
                 throw new IOException("FlowFile Repository told to fail on update for unit test");
             }
+            updates.addAll(records);
+        }
+
+        public List<RepositoryRecord> getUpdates() {
+            return updates;
         }
 
         @Override
@@ -1593,11 +2036,28 @@ public class TestStandardProcessSession {
             return contentClaim;
         }
 
+        public ContentClaim create(byte[] content) throws IOException {
+            final ResourceClaim resourceClaim = claimManager.newResourceClaim("container", "section", String.valueOf(idGenerator.getAndIncrement()), false, false);
+            final ContentClaim contentClaim = new StandardContentClaim(resourceClaim, 0L);
+
+            claimantCounts.put(contentClaim, new AtomicInteger(1));
+            final Path path = getPath(contentClaim);
+            final Path parent = path.getParent();
+            if (Files.exists(parent) == false) {
+                Files.createDirectories(parent);
+            }
+
+            try (final OutputStream out = new FileOutputStream(getPath(contentClaim).toFile())) {
+                out.write(content);
+            }
+            return contentClaim;
+        }
+
         @Override
         public int incrementClaimaintCount(ContentClaim claim) {
-            final AtomicInteger count = claimantCounts.get(claim);
+            AtomicInteger count = claimantCounts.get(claim);
             if (count == null) {
-                throw new IllegalArgumentException("Unknown Claim: " + claim);
+                count = new AtomicInteger(0);
             }
             return count.incrementAndGet();
         }
@@ -1622,7 +2082,7 @@ public class TestStandardProcessSession {
 
         @Override
         public Set<String> getContainerNames() {
-            return new HashSet<String>();
+            return new HashSet<>();
         }
 
         @Override
@@ -1757,6 +2217,11 @@ public class TestStandardProcessSession {
                 public void write(byte[] b) throws IOException {
                     fos.write(b);
                     ((StandardContentClaim) claim).setLength(claim.getLength() + b.length);
+                }
+
+                @Override
+                public void close() throws IOException {
+                    super.close();
                 }
             };
         }

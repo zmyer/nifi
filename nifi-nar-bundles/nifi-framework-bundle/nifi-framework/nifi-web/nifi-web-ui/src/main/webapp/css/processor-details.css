@@ -34,6 +34,13 @@
 
 #read-only-processor-comments {
     height: 100%;
+    white-space: pre-wrap;
+}
+
+#read-only-processor-bundle {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 #read-only-auto-terminate-relationship-names {
@@ -57,4 +64,10 @@ div.concurrently-schedulable-tasks-setting, div.scheduling-period-setting, div.p
 
 div.scheduling-period-setting, div.yield-duration-setting {
     margin-left: 20%;
+}
+
+div.relationship-description {
+    color: #888;
+    margin-left: 16px;
+    margin-top: 2px;
 }

@@ -18,16 +18,17 @@ package org.apache.nifi.web.security.x509;
 
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authentication.AuthenticationResponse;
-import org.apache.nifi.authorization.AuthorizationRequest;
-import org.apache.nifi.authorization.AuthorizationResult;
-import org.apache.nifi.authorization.AuthorizationResult.Result;
+import org.apache.nifi.authorization.AccessDeniedException;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.RequestAction;
+import org.apache.nifi.authorization.Resource;
 import org.apache.nifi.authorization.UserContextKeys;
+import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.resource.ResourceFactory;
 import org.apache.nifi.authorization.user.NiFiUser;
 import org.apache.nifi.authorization.user.NiFiUserDetails;
 import org.apache.nifi.authorization.user.StandardNiFiUser;
+import org.apache.nifi.authorization.user.StandardNiFiUser.Builder;
 import org.apache.nifi.util.NiFiProperties;
 import org.apache.nifi.web.security.InvalidAuthenticationException;
 import org.apache.nifi.web.security.NiFiAuthenticationProvider;
@@ -42,17 +43,30 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ListIterator;
 import java.util.Map;
+import java.util.Set;
 
 /**
  *
  */
 public class X509AuthenticationProvider extends NiFiAuthenticationProvider {
 
+    private static final Authorizable PROXY_AUTHORIZABLE = new Authorizable() {
+        @Override
+        public Authorizable getParentAuthorizable() {
+            return null;
+        }
+
+        @Override
+        public Resource getResource() {
+            return ResourceFactory.getProxyResource();
+        }
+    };
+
     private X509IdentityProvider certificateIdentityProvider;
     private Authorizer authorizer;
 
     public X509AuthenticationProvider(final X509IdentityProvider certificateIdentityProvider, final Authorizer authorizer, final NiFiProperties nifiProperties) {
-        super(nifiProperties);
+        super(nifiProperties, authorizer);
         this.certificateIdentityProvider = certificateIdentityProvider;
         this.authorizer = authorizer;
     }
@@ -71,7 +85,7 @@ public class X509AuthenticationProvider extends NiFiAuthenticationProvider {
 
         if (StringUtils.isBlank(request.getProxiedEntitiesChain())) {
             final String mappedIdentity = mapIdentity(authenticationResponse.getIdentity());
-            return new NiFiAuthenticationToken(new NiFiUserDetails(new StandardNiFiUser(mappedIdentity, request.getClientAddress())));
+            return new NiFiAuthenticationToken(new NiFiUserDetails(new Builder().identity(mappedIdentity).groups(getUserGroups(mappedIdentity)).clientAddress(request.getClientAddress()).build()));
         } else {
             // build the entire proxy chain if applicable - <end-user><proxy1><proxy2>
             final List<String> proxyChain = new ArrayList<>(ProxiedEntitiesUtils.tokenizeProxiedEntitiesChain(request.getProxiedEntitiesChain()));
@@ -79,31 +93,29 @@ public class X509AuthenticationProvider extends NiFiAuthenticationProvider {
 
             // add the chain as appropriate to each proxy
             NiFiUser proxy = null;
-            for (final ListIterator<String> chainIter = proxyChain.listIterator(proxyChain.size()); chainIter.hasPrevious();) {
-                final String identity = mapIdentity(chainIter.previous());
+            for (final ListIterator<String> chainIter = proxyChain.listIterator(proxyChain.size()); chainIter.hasPrevious(); ) {
+                String identity = chainIter.previous();
 
-                if (chainIter.hasPrevious()) {
-                    // authorize this proxy in order to authenticate this user
-                    final AuthorizationRequest proxyAuthorizationRequest = new AuthorizationRequest.Builder()
-                        .identity(identity)
-                        .anonymous(false)
-                        .accessAttempt(true)
-                        .action(RequestAction.WRITE)
-                        .resource(ResourceFactory.getProxyResource())
-                        .userContext(proxy == null ? getUserContext(request) : null) // only set the context for the real user
-                        .build();
-
-                    final AuthorizationResult proxyAuthorizationResult = authorizer.authorize(proxyAuthorizationRequest);
-                    if (!Result.Approved.equals(proxyAuthorizationResult.getResult())) {
-                        throw new UntrustedProxyException(String.format("Untrusted proxy %s", identity));
-                    }
+                // determine if the user is anonymous
+                final boolean isAnonymous = StringUtils.isBlank(identity);
+                if (isAnonymous) {
+                    identity = StandardNiFiUser.ANONYMOUS_IDENTITY;
+                } else {
+                    identity = mapIdentity(identity);
                 }
 
-                // only set the client address for user making the request, we don't know the client address of the proxies
-                if (proxy == null) {
-                    proxy = new StandardNiFiUser(identity, proxy, request.getClientAddress());
-                } else {
-                    proxy = new StandardNiFiUser(identity, proxy, null);
+                final Set<String> groups = getUserGroups(identity);
+
+                // Only set the client address for client making the request because we don't know the clientAddress of the proxied entities
+                String clientAddress = (proxy == null) ? request.getClientAddress() : null;
+                proxy = createUser(identity, groups, proxy, clientAddress, isAnonymous);
+
+                if (chainIter.hasPrevious()) {
+                    try {
+                        PROXY_AUTHORIZABLE.authorize(authorizer, RequestAction.WRITE, proxy);
+                    } catch (final AccessDeniedException e) {
+                        throw new UntrustedProxyException(String.format("Untrusted proxy %s", identity));
+                    }
                 }
             }
 
@@ -111,8 +123,25 @@ public class X509AuthenticationProvider extends NiFiAuthenticationProvider {
         }
     }
 
-    private Map<String,String> getUserContext(final X509AuthenticationRequestToken request) {
-        final Map<String,String> userContext;
+    /**
+     * Returns a regular user populated with the provided values, or if the user should be anonymous, a well-formed instance of the anonymous user with the provided values.
+     *
+     * @param identity      the user's identity
+     * @param chain         the proxied entities
+     * @param clientAddress the requesting IP address
+     * @param isAnonymous   if true, an anonymous user will be returned (identity will be ignored)
+     * @return the populated user
+     */
+    protected static NiFiUser createUser(String identity, Set<String> groups, NiFiUser chain, String clientAddress, boolean isAnonymous) {
+        if (isAnonymous) {
+            return StandardNiFiUser.populateAnonymousUser(chain, clientAddress);
+        } else {
+            return new Builder().identity(identity).groups(groups).chain(chain).clientAddress(clientAddress).build();
+        }
+    }
+
+    private Map<String, String> getUserContext(final X509AuthenticationRequestToken request) {
+        final Map<String, String> userContext;
         if (!StringUtils.isBlank(request.getClientAddress())) {
             userContext = new HashMap<>();
             userContext.put(UserContextKeys.CLIENT_ADDRESS.name(), request.getClientAddress());
